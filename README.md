@@ -3,102 +3,131 @@
 An MCP server that lets a coding agent search a markdown documentation tree and
 cite exactly where each answer came from.
 
+Search returns `path` + `line_start` + `line_end` for every passage, and
+`read_span` reads that exact range back out of the file. An agent using this can
+show its source instead of producing an answer from context.
+
 Works on any directory of `.md` files: a project's `docs/`, a tree of engineering
 reports, or an Obsidian vault.
 
-Search returns `path` + `line_start` + `line_end` for every passage, and
-`read_span` lets the agent go read that exact range back out of the file. An
-agent using this can show its source instead of producing an answer from
-context.
+## Requirements
 
-## Why these four tools
+- Python 3.10 or newer (required by the MCP SDK; macOS system Python is 3.9)
+- `mcp>=2,<3` — the only external dependency. Everything else is stdlib.
 
-The Nokia JD asks for agents "connected to engineering systems — issue tracking,
-documentation, source control, and test data — so they fetch facts instead of
-inventing them", and for "source traceability, tests, and review gates". The
-mapping:
-
-| JD phrase | What implements it |
-|---|---|
-| MCP servers and Python helpers | `server.py` — four tools over stdio |
-| search documentation | `search_notes` |
-| fetch facts instead of inventing them | line spans on every hit; `read_span` verifies |
-| source traceability | the round-trip invariant in `test_index.py` |
-| guardrails | result caps, span caps, path-escape guard, structured error returns |
-| measure whether the tools improve quality | `eval_search.py` |
-
-## Setup
+## Quickstart
 
 ```bash
-pip install "mcp>=2,<3"                    # only external dependency; everything else is stdlib
-python test_index.py               # verify the citation invariant first
+python3.11 -m venv .venv          # any interpreter >= 3.10
+.venv/bin/pip install --upgrade pip
+.venv/bin/pip install "mcp>=2,<3"
 
-# try it on the corpus shipped in this repo
-python eval_search.py --docs ./sample-docs --gold gold.example.jsonl --k 3
+.venv/bin/python test_index.py    # verifies the citation invariant
 
-export DOCS_ROOT="$PWD/sample-docs"   # or your own docs tree
-claude mcp add docs-cite -- python "$PWD/server.py"
+# retrieval quality on the corpus shipped in this repo
+.venv/bin/python eval_search.py --docs ./sample-docs --gold gold.example.jsonl --k 3
 ```
 
-Then in Claude Code: *"search the docs for the BM25 baseline and cite the lines."*
+Register with Claude Code:
 
-`sample-docs/` is a small corpus committed here so the tests, the quickstart and
-CI all run with no setup. Point `--docs` at a real tree to get a meaningful
-benchmark.
+```bash
+claude mcp add docs-cite \
+  --env DOCS_ROOT="$PWD/sample-docs" \
+  -- "$PWD/.venv/bin/python" "$PWD/server.py"
+```
 
-## Files
+`DOCS_ROOT` must be passed with `--env`. The server is spawned as a subprocess
+and does not inherit your shell environment, so exporting the variable first has
+no effect — the server silently falls back to `./sample-docs` and answers every
+query from the wrong corpus.
 
-- `docs_index.py` — heading-aware chunker that preserves 1-based line spans, plus
-  BM25. CJK runs are tokenized as character bigrams, since whitespace
-  tokenization silently returns nothing for Chinese text.
-- `server.py` — the MCP server. Every tool clamps its inputs and returns
-  `{"ok": false, "error": ...}` rather than raising into the agent.
-- `test_index.py` — the invariant that makes provenance real: every chunk's
-  recorded span must reproduce its text when sliced out of the source file.
-  Also covers path escapes, incremental rebuild, and CJK retrieval.
-- `eval_search.py` — Recall@K / NDCG@K / MRR over a hand-written gold set, with
-  a paired bootstrap for comparing two configs.
+Then, in Claude Code: *"search the docs for the BM25 baseline and cite the lines."*
 
-## Build order
+## Tools
 
-**Phase 1 (a few hours).** Point it at a real corpus, run `test_index.py`, wire
-it into Claude Code, use it for a day. Fix whatever breaks on real documents —
-frontmatter, code fences, generated files, very large files.
+| Tool | Arguments | Returns |
+|---|---|---|
+| `search_notes` | `query`, `k` (1-20) | passages with `path`, `heading`, `line_start`, `line_end`, `score` |
+| `read_span` | `path`, `line_start`, `line_end` | the exact lines, for verifying a citation |
+| `list_backlinks` | `note` | documents whose `[[wikilinks]]` point at it |
+| `reindex` | `force` | rescans; only changed files are reparsed |
 
-**Phase 2 (an afternoon).** Write 30-50 gold queries in `gold.jsonl` from
-questions you have actually asked the corpus, and run `eval_search.py`. The
-`zero_hit_queries` list is the interesting output: those are the failure modes.
-The shipped example already surfaces one: a Chinese-language query against
-English documents, which lexical matching cannot bridge.
+Every tool clamps its inputs and returns `{"ok": false, "error": ...}` instead of
+raising into the agent.
 
-**Phase 3 (optional).** Add a dense channel with sentence-transformers + FAISS
-and fuse with RRF. Only do this if Phase 2 shows lexical search actually missing
-things — and report the gain from the paired bootstrap, not from eyeballing.
+## How it works
+
+Documents are split on markdown headings, then on length. Each chunk records the
+1-based line span it occupies in the source file, and **that span must reproduce
+the chunk text exactly when sliced back out**. `test_index.py` asserts this on
+every chunk; if it fails, the server is inventing provenance rather than
+reporting it.
+
+Retrieval is BM25 over chunks. Latin text is tokenized on word boundaries; CJK
+runs are emitted as character bigrams plus unigrams, because whitespace
+tokenization returns nothing useful for Chinese or Japanese.
+
+The index is cached next to the corpus and rebuilt per changed file.
+
+## Evaluation
+
+`eval_search.py` reports Recall@K, NDCG@K and MRR against a gold set of
+`{"query": ..., "relevant": [paths]}` lines, and includes a paired bootstrap for
+comparing two configurations:
+
+```bash
+.venv/bin/python eval_search.py --docs ./sample-docs --gold gold.example.jsonl \
+  --compare chunk_lines=20,40
+```
+
+The `zero_hit_queries` field is the useful output — those are the failure modes.
+The shipped example surfaces one: a Chinese-language query against English
+documents, which lexical matching cannot bridge.
+
+## Known limitations
+
+- **Long documents can dominate results.** A large file becomes many chunks, each
+  matching a little, and can crowd out a shorter, more authoritative document.
+  There is no per-document cap on results yet.
+- **`search_notes` returns chunks; `eval_search.py` scores documents.** The eval
+  deduplicates chunks to their source file before computing metrics, so the
+  numbers describe document-level recall, not what an agent actually sees in its
+  result list.
+- **Code fences are not parsed.** A `#` at the start of a line inside a fenced
+  block is treated as a heading, which can distort chunk boundaries and the
+  heading breadcrumb.
+- **Lexical only.** No dense retrieval, so paraphrases and cross-language queries
+  miss.
+- **The whole index lives in memory.** Fine for thousands of documents; untested
+  well beyond that.
 
 ## Prior art
 
-Several MCP servers already expose Obsidian vaults. Most offer CRUD over the vault
-(read / create / update / search), and many depend on the Obsidian Local REST API
-plugin or the 1.12 CLI, so the app has to be running.
+Several MCP servers already expose Obsidian vaults. Most offer CRUD over the
+vault (read / create / update / search), and many depend on the Obsidian Local
+REST API plugin or the 1.12 CLI, so the app has to be running.
 
 This one is narrower on purpose:
 
 - **Line-level provenance, not file-level.** Existing servers return a matching
   document; this returns the passage plus the exact line span it occupies, and a
-  `read_span` tool to verify it.
-- **Retrieval quality is measured.** `eval_search.py` reports Recall@K / NDCG@K
-  against a gold set, with a paired bootstrap for config changes. The gold set and
-  corpus in this repo are public, so the numbers are reproducible.
+  tool to verify it.
+- **Retrieval quality is measured.** The gold set and corpus in this repo are
+  public, so the numbers are reproducible.
 - **Not Obsidian-specific.** Reads any markdown tree off disk. No plugin, no
-  running app, no Node; stdlib only apart from `mcp`.
+  running app, no Node.
 
 ## Do not commit private corpora
 
-`.docs_cite_index.json` stores the **full text** of every chunk of every document,
-as do the eval caches under `.cache/`. Both are in `.gitignore` here — but the
-cache is written next to the corpus by default, so if you point this at a private
-tree that is itself a git repository, add `.docs_cite_index.json` to *that*
-repository's `.gitignore` as well.
+`.docs_cite_index.json` stores the **full text** of every chunk of every
+document, as do the eval caches under `.cache/`. Both are in `.gitignore` here —
+but the cache is written next to the corpus by default, so if you point this at a
+private tree that is itself a git repository, add `.docs_cite_index.json` to
+*that* repository's `.gitignore` as well.
 
 `gold.jsonl` is gitignored for the same reason: real queries describe the corpus
 they were written against. `gold.example.jsonl` is the shareable stand-in.
+
+## License
+
+MIT
