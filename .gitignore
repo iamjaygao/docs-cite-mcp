@@ -1,0 +1,23 @@
+# ---- vault content must never be committed ----
+# The index cache stores the FULL TEXT of every chunk of every note.
+.docs_cite_index.json
+.docs_cite_index.tmp
+.mcp_index.json
+.cache/
+*.index.json
+
+# Real gold queries name your own notes and research. Commit gold.example.jsonl.
+gold.jsonl
+gold.*.jsonl
+!gold.example.jsonl
+
+# Local working notes
+NOTES.local.md
+
+# ---- ordinary python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.DS_Store

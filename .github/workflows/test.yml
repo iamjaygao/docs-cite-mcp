@@ -1,0 +1,28 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # docs_index.py, eval_search.py and test_index.py are stdlib-only,
+      # so the suite runs with no install step.
+      - name: Index and citation invariants
+        run: python test_index.py
+      - name: Retrieval eval on the sample corpus
+        run: python eval_search.py --docs ./sample-docs --gold gold.example.jsonl --k 3
+
+      - name: Server imports cleanly
+        run: |
+          pip install mcp
+          python -c "import server; print('tools:', len(server.mcp._tool_manager.list_tools()))"

@@ -1,0 +1,7 @@
+{"query": "what is the BM25 baseline NDCG", "relevant": ["reports/ranking-baselines.md"]}
+{"query": "why do Japanese queries underperform", "relevant": ["reports/ranking-baselines.md"]}
+{"query": "can I compare numbers from different candidate pools", "relevant": ["reports/evaluation-protocol.md"]}
+{"query": "how are relevance grades mapped to gains", "relevant": ["reports/evaluation-protocol.md"]}
+{"query": "how are documents split into chunks", "relevant": ["guides/indexing.md"]}
+{"query": "中文分词怎么处理", "relevant": ["guides/indexing.md"]}
+{"query": "bootstrap resampling method", "relevant": ["reports/evaluation-protocol.md"]}
