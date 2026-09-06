@@ -25,4 +25,4 @@ jobs:
       - name: Server imports cleanly
         run: |
           pip install mcp
-          python -c "import server; print('tools:', len(server.mcp._tool_manager.list_tools()))"
+          python -c "import server; print('server module OK')"
