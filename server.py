@@ -8,9 +8,12 @@ show where an answer came from instead of producing it from context.
 Works on any directory of .md files -- a docs/ folder, an engineering report
 tree, or an Obsidian vault.
 
+Requires the MCP Python SDK v2 (FastMCP was renamed to MCPServer in 2.0).
+
 Run:
     export DOCS_ROOT=/path/to/docs
-    uv run --with mcp python server.py        # or: pip install mcp && python server.py
+    pip install "mcp>=2,<3"
+    python server.py
 
 Register with Claude Code:
     claude mcp add docs-cite -- python /path/to/server.py
@@ -19,9 +22,10 @@ Register with Claude Code:
 from __future__ import annotations
 
 import os
+import threading
 from pathlib import Path
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 from docs_index import DocsIndex
 
@@ -32,16 +36,23 @@ MAX_RESULTS = 20
 MAX_SNIPPET_CHARS = 1200
 MAX_SPAN_LINES = 400
 
-mcp = FastMCP("docs-cite")
+mcp = MCPServer("docs-cite", version="0.1.0")
+
+# SDK v2 runs synchronous handlers on worker threads, so tools can now execute
+# concurrently. The index is shared mutable state: without this lock two racing
+# calls can both build it, and a reindex can swap chunks out from under a search.
+_index_lock = threading.Lock()
 _index: DocsIndex | None = None
 
 
 def get_index() -> DocsIndex:
     global _index
-    if _index is None:
-        _index = DocsIndex(DOCS_ROOT)
-        _index.build()
-    return _index
+    with _index_lock:
+        if _index is None:
+            index = DocsIndex(DOCS_ROOT)
+            index.build()
+            _index = index
+        return _index
 
 
 def _truncate(text: str) -> tuple[str, bool]:
@@ -125,7 +136,9 @@ def list_backlinks(note: str) -> dict:
 def reindex(force: bool = False) -> dict:
     """Rescan the docs tree. Only changed files are reparsed unless force=True."""
     try:
-        return {"ok": True, **get_index().build(force=force)}
+        index = get_index()
+        with _index_lock:
+            return {"ok": True, **index.build(force=force)}
     except Exception as exc:
         return {"ok": False, "error": type(exc).__name__, "detail": str(exc)}
 

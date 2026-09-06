@@ -30,7 +30,7 @@ mapping:
 ## Setup
 
 ```bash
-pip install mcp                    # only external dependency; everything else is stdlib
+pip install "mcp>=2,<3"                    # only external dependency; everything else is stdlib
 python test_index.py               # verify the citation invariant first
 
 # try it on the corpus shipped in this repo
