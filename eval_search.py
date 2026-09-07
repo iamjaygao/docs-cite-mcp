@@ -10,8 +10,19 @@ Gold format (gold.jsonl), one object per line:
 Relevance is judged at note level, so writing 30-50 of these by hand from
 questions you have actually asked this corpus is an afternoon, not a project.
 
+Two units, and they answer different questions:
+
+    --unit document  dedups chunks to their source file. "Can the retriever find
+                     the right document at all?"
+    --unit chunk     scores the ranked list the agent actually receives, where a
+                     long document filling the top slots pushes answers past the
+                     cutoff. "Is what the agent sees any good?"
+
+Report both. A gap between them is the crowding problem, quantified.
+
 Usage:
     python eval_search.py --docs ./sample-docs --gold gold.jsonl
+    python eval_search.py --docs ./sample-docs --gold gold.jsonl --unit chunk
     python eval_search.py --docs ./sample-docs --gold gold.jsonl --compare chunk_lines=20,40
 """
 
@@ -21,6 +32,7 @@ import argparse
 import json
 import math
 import random
+from collections import Counter
 from pathlib import Path
 
 import docs_index
@@ -65,26 +77,61 @@ def dedup_paths(hits: list[dict]) -> list[str]:
     return seen
 
 
-def run(index: DocsIndex, gold: list[dict], k: int, depth: int) -> dict:
+def chunk_ranking(hits: list[dict]) -> list[str]:
+    """
+    The list the agent actually sees: one entry per chunk, in rank order.
+
+    Repeat chunks from an already-seen document keep their slot but score
+    nothing, so a long document that fills the top of the list pushes real
+    answers out of the cutoff instead of being quietly compacted away.
+    """
+    ranking: list[str] = []
+    credited: set[str] = set()
+    for hit in hits:
+        path = hit["path"]
+        if path in credited:
+            ranking.append("")          # occupies a slot, matches no gold entry
+        else:
+            ranking.append(path)
+            credited.add(path)
+    return ranking
+
+
+def concentration(hits: list[dict], k: int) -> float:
+    """Share of the top-k slots taken by whichever single document has the most."""
+    top = [h["path"] for h in hits[:k]]
+    if not top:
+        return 0.0
+    return max(Counter(top).values()) / len(top)
+
+
+def run(index: DocsIndex, gold: list[dict], k: int, depth: int,
+        unit: str = "document") -> dict:
     per_query = []
     for row in gold:
         relevant = set(row["relevant"])
-        ranked = dedup_paths(index.search(row["query"], k=depth))
+        if not relevant:
+            continue
+        hits = index.search(row["query"], k=depth)
+        ranked = chunk_ranking(hits) if unit == "chunk" else dedup_paths(hits)
         per_query.append(
             {
                 "query": row["query"],
                 "recall": recall_at_k(ranked, relevant, k),
                 "ndcg": ndcg_at_k(ranked, relevant, k),
                 "rr": rr_at_k(ranked, relevant, k),
+                "concentration": concentration(hits, k),
                 "found": bool(set(ranked[:k]) & relevant),
             }
         )
     n = len(per_query) or 1
     return {
+        "unit": unit,
         "queries": len(per_query),
         f"recall@{k}": sum(q["recall"] for q in per_query) / n,
         f"ndcg@{k}": sum(q["ndcg"] for q in per_query) / n,
         f"mrr@{k}": sum(q["rr"] for q in per_query) / n,
+        "top_doc_share": sum(q["concentration"] for q in per_query) / n,
         "zero_hit_queries": [q["query"] for q in per_query if not q["found"]],
         "per_query": per_query,
     }
@@ -127,6 +174,9 @@ def main() -> int:
     ap.add_argument("--gold", required=True)
     ap.add_argument("--k", type=int, default=5)
     ap.add_argument("--depth", type=int, default=20, help="chunks retrieved before dedup")
+    ap.add_argument("--unit", choices=["document", "chunk"], default="document",
+                    help="document: dedup chunks to their file (retrieval quality). "
+                         "chunk: score the list the agent actually sees (result crowding).")
     ap.add_argument(
         "--compare",
         help="A/B one knob, e.g. chunk_lines=20,40 -- reindexes and paired-bootstraps",
@@ -145,7 +195,7 @@ def main() -> int:
     if not args.compare:
         index = DocsIndex(args.docs)
         index.build()
-        result = run(index, gold, args.k, args.depth)
+        result = run(index, gold, args.k, args.depth, args.unit)
         print(json.dumps({k: v for k, v in result.items() if k != "per_query"}, indent=2,
                          ensure_ascii=False))
         return 0
@@ -163,7 +213,7 @@ def main() -> int:
         cache_dir.mkdir(exist_ok=True)
         index = DocsIndex(args.docs, cache_path=cache_dir / f"eval_index_{value}.json")
         index.build(force=True)
-        runs[value] = run(index, gold, args.k, args.depth)
+        runs[value] = run(index, gold, args.k, args.depth, args.unit)
 
     for metric in (f"recall@{args.k}", f"ndcg@{args.k}"):
         key = "recall" if metric.startswith("recall") else "ndcg"
