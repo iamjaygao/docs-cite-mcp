@@ -1,0 +1,14 @@
+{
+  "unit": "document",
+  "queries": 28,
+  "recall@5": 0.7619047619047619,
+  "ndcg@5": 0.7414669046234855,
+  "mrr@5": 0.8125,
+  "top_doc_share": 0.5357142857142857,
+  "zero_hit_queries": [
+    "What model architecture was used for the official US Task 1 ranking baseline?",
+    "What model architecture was used for the official Spanish Task 1 ranking baseline?",
+    "What model architecture was used for the official Japanese Task 1 ranking baseline?",
+    "What performance was predicted before running the full V2 cross-encoder experiment?"
+  ]
+}

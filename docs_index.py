@@ -146,7 +146,10 @@ class DocsIndex:
     def _walk(self) -> list[Path]:
         out = []
         for dirpath, dirnames, filenames in os.walk(self.root):
-            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            # skip dot-directories wholesale: .git, .venv, .pytest_cache, .obsidian...
+            dirnames[:] = [
+                d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")
+            ]
             out.extend(
                 Path(dirpath) / f for f in filenames if f.endswith(".md")
             )

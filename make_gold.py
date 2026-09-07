@@ -91,6 +91,18 @@ class Corpus:
         print()
 
 
+def normalise(raw: str) -> str:
+    """
+    Accept what a Chinese IME actually produces, plus an accidentally pasted
+    prompt. Rejecting a fullwidth comma only costs the annotator a retype.
+    """
+    cleaned = raw.strip()
+    for prefix in ("relevant>", "query>"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):].strip()
+    return cleaned.replace("\uff0c", ",").replace("\u3001", ",").replace("\u3000", " ")
+
+
 def load_existing(out: Path) -> list[dict]:
     if not out.exists():
         return []
@@ -138,7 +150,7 @@ def main() -> int:
 
     while True:
         try:
-            query = input("query> ").strip()
+            query = normalise(input("query> "))
         except (EOFError, KeyboardInterrupt):
             print()
             break
@@ -182,11 +194,34 @@ def main() -> int:
 
         print("  which documents answer this? numbers from /list, comma separated")
         print("  (blank = no document answers it, which is itself worth recording)")
-        try:
-            picked = input("  relevant> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
+        picked = None
+        while True:
+            try:
+                picked = normalise(input("  relevant> "))
+            except (EOFError, KeyboardInterrupt):
+                print()
+                picked = None
+                break
+            # inspection commands work here too, so you can check before labelling
+            if picked == "/list":
+                corpus.show_map()
+                continue
+            if picked.startswith("/grep "):
+                corpus.grep(picked[6:].strip())
+                continue
+            if picked.startswith("/show "):
+                try:
+                    corpus.show(int(picked[6:].strip()))
+                except (ValueError, IndexError):
+                    print("  usage: /show <document number>")
+                continue
+            if picked == "/skip":
+                picked = None
+                break
             break
+        if picked is None:
+            print("  skipped\n")
+            continue
 
         relevant: list[str] = []
         bad = False
@@ -200,6 +235,7 @@ def main() -> int:
         if bad:
             continue
 
+        relevant = list(dict.fromkeys(relevant))   # a repeated number is a typo
         rows.append({"query": query, "relevant": relevant})
         seen.add(query)
         save(out, rows)
