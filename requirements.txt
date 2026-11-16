@@ -1,0 +1,4 @@
+mcp>=2,<3
+# optional: without these, PDF / Word files are listed in files_skipped and Markdown still works
+pypdf>=5,<8
+python-docx>=1.1,<2

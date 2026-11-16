@@ -1,12 +1,13 @@
 """
-MCP server exposing a markdown documentation tree to Claude Code / VS Code agents.
+MCP server exposing a documentation tree to Claude Code / VS Code agents.
 
-Every search result carries path + line span, and read_span lets the agent go
-verify that span against the file. The point is that an agent using this can
-show where an answer came from instead of producing it from context.
+Every search result carries path + line span (plus the page, for a PDF), and
+read_span lets the agent go verify that span against the file. The point is
+that an agent using this can show where an answer came from instead of
+producing it from context.
 
-Works on any directory of .md files -- a docs/ folder, an engineering report
-tree, or an Obsidian vault.
+Works on any directory of Markdown, PDF and Word (.docx) files -- a docs/
+folder, an engineering report tree, or an Obsidian vault.
 
 The tool contract has two layers:
 
@@ -22,7 +23,7 @@ Requires the MCP Python SDK v2 (FastMCP was renamed to MCPServer in 2.0).
 
 Run:
     export DOCS_ROOT=/path/to/docs
-    pip install "mcp>=2,<3"
+    pip install -r requirements.txt     # mcp, plus pypdf and python-docx
     python server.py
 
 Register with Claude Code:
@@ -41,7 +42,18 @@ from pydantic import Field
 # pydantic needs typing_extensions.TypedDict to build schemas on Python < 3.12
 from typing_extensions import NotRequired, TypedDict
 
-from docs_index import DEFAULT_MAX_PER_DOC, DocsIndex, InvalidSpan, PathOutsideRoot
+from docs_index import (
+    DEFAULT_MAX_PER_DOC,
+    DocsIndex,
+    InvalidSpan,
+    MissingDependency,
+    NoTextLayer,
+    PageOutOfRange,
+    PageRequired,
+    PathOutsideRoot,
+    UnreadableDocument,
+    UnsupportedFormat,
+)
 
 DOCS_ROOT = os.environ.get("DOCS_ROOT", "./sample-docs")
 
@@ -56,11 +68,16 @@ ERROR_CODES = {
     "invalid_span": "line_end is before line_start, or the span is empty after clamping",
     "path_outside_root": "path resolves outside DOCS_ROOT",
     "not_found": "no such file under DOCS_ROOT",
-    "unreadable": "file exists but is not valid UTF-8 or cannot be read",
+    "page_required": "read_span on a PDF needs a page",
+    "page_out_of_range": "the PDF has no such page, or a page was given for a non-PDF file",
+    "unsupported_format": "not a Markdown, PDF or Word (.docx) file",
+    "missing_dependency": "pypdf or python-docx is not installed for this format",
+    "no_text_layer": "PDF has no extractable text (a scan); OCR is not supported",
+    "unreadable": "file cannot be read: bad UTF-8, corrupt, encrypted, or permissions",
     "internal_error": "unexpected failure; detail carries the exception text",
 }
 
-mcp = MCPServer("docs-cite", version="0.2.0")
+mcp = MCPServer("docs-cite", version="0.3.0")
 
 # SDK v2 runs synchronous handlers on worker threads, so tools execute
 # concurrently. The index makes that safe itself (builds are serialised, and a
@@ -98,7 +115,17 @@ def _from_exception(exc: Exception) -> dict:
         return _error("invalid_span", str(exc))
     if isinstance(exc, FileNotFoundError):
         return _error("not_found", str(exc))
-    if isinstance(exc, (UnicodeDecodeError, OSError)):
+    if isinstance(exc, PageRequired):
+        return _error("page_required", str(exc))
+    if isinstance(exc, PageOutOfRange):
+        return _error("page_out_of_range", str(exc))
+    if isinstance(exc, UnsupportedFormat):
+        return _error("unsupported_format", str(exc))
+    if isinstance(exc, MissingDependency):
+        return _error("missing_dependency", str(exc))
+    if isinstance(exc, NoTextLayer):
+        return _error("no_text_layer", str(exc))
+    if isinstance(exc, (UnreadableDocument, UnicodeDecodeError, OSError)):
         return _error("unreadable", str(exc))
     return _error("internal_error", f"{type(exc).__name__}: {exc}")
 
@@ -115,8 +142,10 @@ class SearchHit(TypedDict):
     chunk_id: str
     path: str
     heading: str
-    line_start: int
+    page: int | None            # PDF page (1-based); None for Markdown and Word
+    line_start: int             # within `page` for a PDF; a block number for Word
     line_end: int
+    cite: str                   # "a.md:3-8", "b.pdf p.2:1-4", "c.docx ¶3-5"
     score: float
     text: str
     truncated: bool
@@ -131,9 +160,11 @@ class SearchResult(_Status):
 
 class SpanResult(_Status):
     path: NotRequired[str]
+    page: NotRequired[int | None]
     line_start: NotRequired[int]
     line_end: NotRequired[int]
-    total_lines: NotRequired[int]
+    total_lines: NotRequired[int]   # lines in the file, or in the page for a PDF
+    total_pages: NotRequired[int]   # 1 for Markdown and Word
     text: NotRequired[str]
 
 
@@ -147,7 +178,7 @@ class ReindexResult(_Status):
     chunks: NotRequired[int]
     files_reparsed: NotRequired[int]
     files_reused: NotRequired[int]
-    files_skipped: NotRequired[list[str]]       # unreadable files (bad UTF-8, permissions)
+    files_skipped: NotRequired[list[str]]       # unreadable, scanned, or missing a parser
     cache_written: NotRequired[bool]
     cache_error: NotRequired[str | None]        # set when the cache could not be saved
 
@@ -168,11 +199,13 @@ def search_notes(
     )] = DEFAULT_MAX_PER_DOC,
 ) -> SearchResult:
     """
-    Search the docs and return passages with their exact source location.
+    Search Markdown, PDF and Word docs; return passages with their exact source location.
 
-    Every hit includes `path`, `line_start` and `line_end`. Cite those rather
-    than paraphrasing from memory; call read_span to verify before relying on a
-    passage. Snippets longer than 1200 characters come back with truncated=true.
+    Every hit includes `path`, `line_start`, `line_end`, `page` (PDFs only) and
+    a ready-made `cite` string. Cite those rather than paraphrasing from memory;
+    call read_span with the same path, lines and page to verify a passage before
+    relying on it. Snippets longer than 1200 characters come back with
+    truncated=true.
     """
     query = query.strip()
     if not query:
@@ -192,7 +225,7 @@ def search_notes(
         "query": query,
         "returned": len(results),
         "results": results,
-        "note": "cite path + line_start-line_end; call read_span to verify",
+        "note": "cite each hit's `cite`; call read_span (with page for PDFs) to verify",
     }
 
 
@@ -201,12 +234,17 @@ def read_span(
     path: Annotated[str, Field(min_length=1, description='Root-relative path, e.g. "reports/phase-1.md".')],
     line_start: Annotated[int, Field(ge=1, description="1-based first line, inclusive.")],
     line_end: Annotated[int, Field(ge=1, description="1-based last line, inclusive.")],
+    page: Annotated[int | None, Field(
+        ge=1, description="PDF page, 1-based. Required for PDFs; omit for Markdown and Word.",
+    )] = None,
 ) -> SpanResult:
     """
-    Read an exact line range from a note, so a cited passage can be checked.
+    Read an exact line range from a document, so a cited passage can be checked.
 
-    At most 400 lines per call. A span running past the end of the file is
-    clamped to the last line; total_lines reports the file length.
+    Lines are those search_notes reported: file lines for Markdown, lines within
+    `page` for a PDF, blocks (paragraphs and table rows) for Word. At most 400
+    lines per call. A span running past the end is clamped to the last line;
+    total_lines reports the length.
     """
     if line_end < line_start:
         return _error("invalid_span", f"line_end {line_end} is before line_start {line_start}")
@@ -216,7 +254,7 @@ def read_span(
             f"requested {line_end - line_start + 1} lines, max {MAX_SPAN_LINES}",
         )
     try:
-        return {"ok": True, **get_index().read_span(path, line_start, line_end)}
+        return {"ok": True, **get_index().read_span(path, line_start, line_end, page)}
     except Exception as exc:
         return _from_exception(exc)
 

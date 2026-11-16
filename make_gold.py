@@ -29,7 +29,7 @@ import json
 import re
 from pathlib import Path
 
-from docs_index import DocsIndex, iter_markdown_files, read_markdown
+from docs_index import DocsIndex, document_text, iter_corpus_files
 
 REVEAL_DEPTH = 10
 
@@ -50,11 +50,11 @@ class Corpus:
         self.text: dict[str, str] = {}
         # the same membership rules and decoding as the index: a document the
         # retriever can return must be one you can find here to label
-        for path in iter_markdown_files(root):
+        for path in iter_corpus_files(root):
             rel = path.relative_to(root.resolve()).as_posix()
             try:
-                self.text[rel] = read_markdown(path)
-            except (UnicodeDecodeError, OSError):
+                self.text[rel] = document_text(path)
+            except (UnicodeDecodeError, OSError, ValueError, RuntimeError):
                 continue
             self.paths.append(rel)
 

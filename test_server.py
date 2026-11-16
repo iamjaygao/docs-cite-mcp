@@ -96,6 +96,26 @@ async def main() -> int:
             check("read_span returns the exact cited text",
                   span.get("ok") and span.get("text") == top["text"], f"-> {span}")
 
+        page_schema = tools["read_span"].input_schema["properties"].get("page", {})
+        check("read_span publishes an optional page", "page" not in
+              tools["read_span"].input_schema.get("required", []) and page_schema, f"-> {page_schema}")
+        _, found = await call(client, "search_notes", {"query": "median latency fell", "k": 1})
+        pdf_hit = (found.get("results") or [{}])[0]
+        check("a PDF hit carries page and cite",
+              pdf_hit.get("page") == 1 and pdf_hit.get("cite", "").startswith("reports/latency-review.pdf p.1:"),
+              f"-> {pdf_hit.get('cite')}")
+        if pdf_hit:
+            _, span = await call(client, "read_span", {
+                "path": pdf_hit["path"], "line_start": pdf_hit["line_start"],
+                "line_end": pdf_hit["line_end"], "page": pdf_hit["page"],
+            })
+            check("PDF citation verifies through read_span", span.get("text") == pdf_hit["text"],
+                  f"-> {span}")
+        _, found = await call(client, "search_notes", {"query": "roll back a release", "k": 1})
+        docx_hit = (found.get("results") or [{}])[0]
+        check("a Word hit is cited by block", "deployment-runbook.docx ¶" in docx_hit.get("cite", ""),
+              f"-> {docx_hit.get('cite')}")
+
         _, links = await call(client, "list_backlinks", {"note": "evaluation-protocol.md"})
         check("backlinks resolve through the client",
               links.get("backlinks") == ["reports/ranking-baselines.md"], f"-> {links}")
@@ -121,6 +141,12 @@ async def main() -> int:
              "invalid_span"),
             ("read_span", {"path": "guides/indexing.md", "line_start": 1, "line_end": 1000},
              "span_too_large"),
+            ("read_span", {"path": "reports/latency-review.pdf", "line_start": 1, "line_end": 2},
+             "page_required"),
+            ("read_span", {"path": "reports/latency-review.pdf", "line_start": 1, "line_end": 2,
+                           "page": 7}, "page_out_of_range"),
+            ("read_span", {"path": "guides/indexing.md", "line_start": 1, "line_end": 2, "page": 1},
+             "page_out_of_range"),
         ]
         for tool, args, code in cases:
             result, out = await call(client, tool, args)

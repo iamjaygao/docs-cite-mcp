@@ -5,6 +5,8 @@ path + line span, then read each span back and confirm it matches.
 
 Run from the repo root:
     python examples/cite_and_verify.py "what is the BM25 baseline NDCG"
+    python examples/cite_and_verify.py "how far did median latency fall"     # a PDF
+    python examples/cite_and_verify.py "how do I roll back a release"        # a Word file
     python examples/cite_and_verify.py --docs /path/to/your/docs "your question"
 
 Exits non-zero if any citation fails to verify.
@@ -45,13 +47,11 @@ async def main(query: str, docs: Path, k: int) -> int:
 
         verified = 0
         for i, hit in enumerate(found["results"], start=1):
-            cite = f"{hit['path']}:{hit['line_start']}-{hit['line_end']}"
-            print(f"[{i}] {cite}  ({hit['heading'] or 'top of file'}, score {hit['score']})")
-            span = (await client.call_tool("read_span", {
-                "path": hit["path"],
-                "line_start": hit["line_start"],
-                "line_end": hit["line_end"],
-            })).structured_content
+            print(f"[{i}] {hit['cite']}  ({hit['heading'] or 'no heading'}, score {hit['score']})")
+            args = {"path": hit["path"], "line_start": hit["line_start"], "line_end": hit["line_end"]}
+            if hit["page"] is not None:                 # PDF citations are page + lines
+                args["page"] = hit["page"]
+            span = (await client.call_tool("read_span", args)).structured_content
             # a truncated snippet is a prefix of the full span, not the whole of it
             ok = span.get("ok") and (
                 span["text"].startswith(hit["text"]) if hit["truncated"] else span["text"] == hit["text"]

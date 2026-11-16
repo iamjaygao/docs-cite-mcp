@@ -5,3 +5,6 @@
 {"query": "how are documents split into chunks", "relevant": ["guides/indexing.md"]}
 {"query": "中文分词怎么处理", "relevant": ["guides/indexing.md"]}
 {"query": "bootstrap resampling method", "relevant": ["reports/evaluation-protocol.md"]}
+{"query": "how far did median search latency fall", "relevant": ["reports/latency-review.pdf"]}
+{"query": "how do I roll back to a previous release", "relevant": ["guides/deployment-runbook.docx"]}
+{"query": "which Python versions are tested in CI", "relevant": ["guides/deployment-runbook.docx"]}

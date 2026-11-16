@@ -1,9 +1,23 @@
 """
-Line-accurate chunking + BM25 retrieval over a markdown documentation tree.
+Line-accurate chunking + BM25 retrieval over a documentation tree of Markdown,
+PDF and Word files.
 
 Design rule: every chunk carries the exact 1-based line span it came from, and
-that span must round-trip against the source file. If it doesn't, a citation is
+that span must round-trip against the source. If it doesn't, a citation is
 decoration rather than a reference. test_index.py enforces this.
+
+Each format is read into a *view*: the lines that both indexing and read_span
+see, produced by one function, so the round-trip holds for every format.
+
+  * Markdown: the file's own lines.
+  * PDF: the extracted text layer, one view per page. A citation is a page plus
+    a line range within that page.
+  * Word (.docx): one line per block -- a paragraph, or a table row rendered as
+    "| a | b |" -- with Heading/Title styles rendered as "#" headings, so the
+    Markdown chunker and breadcrumbs apply unchanged.
+
+PDF and Word support needs pypdf / python-docx. Without them those files are
+reported in files_skipped and Markdown works as before.
 
 Keeping that true while the corpus changes underneath a running server takes
 three more rules:
@@ -18,11 +32,12 @@ three more rules:
   * Versioned. The on-disk cache records the chunker version and settings; a
     cache written by different code is discarded, not reused.
 
-Stdlib only, so it runs anywhere without an install step.
+The Markdown path is stdlib only, so it runs anywhere without an install step.
 """
 
 from __future__ import annotations
 
+import functools
 import heapq
 import json
 import math
@@ -37,7 +52,8 @@ from pathlib import Path, PurePosixPath
 
 # Bump whenever chunking, tokenizing or the cache layout changes: caches written
 # under another version are discarded instead of silently reused.
-CACHE_VERSION = 3
+CACHE_VERSION = 4
+SUPPORTED_SUFFIXES = {".md", ".pdf", ".docx"}
 SKIP_DIRS = {".obsidian", ".trash", ".git", "node_modules", ".DS_Store"}
 MAX_CHUNK_LINES = 40          # long sections get split further, at a paragraph break
 MIN_CHUNK_CHARS = 20          # drop near-empty fragments
@@ -64,16 +80,41 @@ class InvalidSpan(ValueError):
     """A requested line range is empty or inverted."""
 
 
+class PageRequired(ValueError):
+    """read_span on a PDF was called without a page."""
+
+
+class PageOutOfRange(ValueError):
+    """The page does not exist, or a page was given for a non-PDF file."""
+
+
+class UnsupportedFormat(ValueError):
+    """The file type is not one of SUPPORTED_SUFFIXES."""
+
+
+class MissingDependency(RuntimeError):
+    """The optional library for this format is not installed."""
+
+
+class NoTextLayer(ValueError):
+    """A PDF with no extractable text, typically a scan. OCR is not supported."""
+
+
+class UnreadableDocument(ValueError):
+    """A PDF or Word file the parser rejected: corrupt, encrypted, not really that format."""
+
+
 # ---------- corpus membership: the single definition every tool shares ----------
 
-def iter_markdown_files(root: Path) -> list[Path]:
+def iter_corpus_files(root: Path) -> list[Path]:
     """
-    Every .md file that belongs to the corpus, in a stable order.
+    Every supported file that belongs to the corpus, in a stable order.
 
     Skips dot-directories and SKIP_DIRS, does not descend into directory
     symlinks, and drops file symlinks that resolve outside the root -- those
     could be searched but never read back, so their citations could not be
-    verified. make_gold.py lists the corpus through this same function.
+    verified. Word lock files (~$name.docx) are not documents. make_gold.py
+    lists the corpus through this same function.
     """
     root = root.resolve()
     out = []
@@ -82,7 +123,7 @@ def iter_markdown_files(root: Path) -> list[Path]:
             d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")
         )
         for name in sorted(filenames):
-            if not name.endswith(".md"):
+            if Path(name).suffix.lower() not in SUPPORTED_SUFFIXES or name.startswith("~$"):
                 continue
             path = Path(dirpath) / name
             if path.is_symlink() and not path.resolve().is_relative_to(root):
@@ -99,6 +140,107 @@ def read_markdown(path: Path) -> str:
     first-line heading. Universal newlines turn CRLF into LF on both paths.
     """
     return path.read_text(encoding="utf-8-sig")
+
+
+# ---------- views: what indexing and read_span both read ----------
+
+@dataclass(frozen=True)
+class DocView:
+    kind: str                              # "markdown" | "pdf" | "docx"
+    pages: tuple[tuple[str, ...], ...]     # PDF: one entry per page; others: exactly one
+
+
+def load_view(path: Path) -> DocView:
+    suffix = path.suffix.lower()
+    if suffix == ".md":
+        return DocView("markdown", (tuple(read_markdown(path).split("\n")),))
+    if suffix == ".pdf":
+        return DocView("pdf", _pdf_pages(path))
+    if suffix == ".docx":
+        return DocView("docx", (_docx_lines(path),))
+    raise UnsupportedFormat(f"unsupported file type: {path.name}")
+
+
+@functools.lru_cache(maxsize=32)
+def _cached_view(path: str, stamp: tuple[int, int] | None) -> DocView:
+    # keyed on the stamp, so an edited file is never served from the cache
+    return load_view(Path(path))
+
+
+def document_text(path: Path) -> str:
+    """A whole view as one string, for listing and grepping (make_gold.py)."""
+    view = load_view(path)
+    if view.kind != "pdf":
+        return "\n".join(view.pages[0])
+    return "\n".join(
+        line for n, page in enumerate(view.pages, start=1) for line in (f"[page {n}]", *page)
+    )
+
+
+def _pdf_pages(path: Path) -> tuple[tuple[str, ...], ...]:
+    try:
+        import pypdf
+    except ImportError as exc:
+        raise MissingDependency("PDF support needs pypdf: pip install pypdf") from exc
+    try:
+        reader = pypdf.PdfReader(str(path))
+        if reader.is_encrypted and not reader.decrypt(""):
+            raise UnreadableDocument("PDF is password-protected")
+        pages = tuple(
+            tuple((page.extract_text() or "").replace("\r\n", "\n").replace("\r", "\n").split("\n"))
+            for page in reader.pages
+        )
+    except UnreadableDocument:
+        raise
+    except Exception as exc:  # parsers of untrusted binaries raise anything
+        raise UnreadableDocument(f"{type(exc).__name__}: {exc}") from exc
+    if not any(line.strip() for page in pages for line in page):
+        raise NoTextLayer("no extractable text (a scanned PDF?); OCR is not supported")
+    return pages
+
+
+_DOCX_HEADING = re.compile(r"^Heading (\d)$")
+
+
+def _docx_lines(path: Path) -> tuple[str, ...]:
+    try:
+        import docx
+        from docx.table import Table
+        from docx.text.paragraph import Paragraph
+    except ImportError as exc:
+        raise MissingDependency("Word support needs python-docx: pip install python-docx") from exc
+    try:
+        document = docx.Document(str(path))
+        lines: list[str] = []
+        for element in document.element.body.iterchildren():
+            tag = element.tag.rsplit("}", 1)[-1]
+            if tag == "p":
+                lines.append(_docx_paragraph(Paragraph(element, document)))
+            elif tag == "tbl":
+                for row in Table(element, document).rows:
+                    cells, seen = [], set()
+                    for cell in row.cells:           # a merged cell repeats: keep it once
+                        if id(cell._tc) not in seen:
+                            seen.add(id(cell._tc))
+                            cells.append(" ".join(cell.text.split()))
+                    lines.append("| " + " | ".join(cells) + " |")
+    except Exception as exc:
+        raise UnreadableDocument(f"{type(exc).__name__}: {exc}") from exc
+    return tuple(lines)
+
+
+def _docx_paragraph(paragraph) -> str:
+    text = " ".join(paragraph.text.split("\n"))      # soft line breaks stay in one block
+    style = paragraph.style.name if paragraph.style is not None else ""
+    m = _DOCX_HEADING.match(style)
+    level = 1 if style == "Title" else int(m.group(1)) if m else 0
+    if level and text.strip():
+        return "#" * min(level, 6) + " " + text.strip()
+    # body text that would read as a heading or a code fence is escaped, so the
+    # Markdown chunker only ever sees structure that Word's styles declared
+    if _HEADING.match(text) or _FENCE.match(text):
+        return "\\" + text
+    return text
 
 
 def _stamp(path: Path) -> tuple[int, int] | None:
@@ -133,9 +275,19 @@ class Chunk:
     chunk_id: str
     path: str          # relative to docs root
     heading: str       # "H1 > H2 > H3" breadcrumb, "" at file top
-    line_start: int    # 1-based, inclusive
+    line_start: int    # 1-based, inclusive (within `page` for a PDF)
     line_end: int      # 1-based, inclusive
     text: str
+    page: int | None = None   # PDF page, 1-based; None for other formats
+
+    @property
+    def cite(self) -> str:
+        """Human-readable locator: path:12-30, path p.3:12-30, path ¶12-30 (Word blocks)."""
+        if self.page is not None:
+            return f"{self.path} p.{self.page}:{self.line_start}-{self.line_end}"
+        if self.path.lower().endswith(".docx"):
+            return f"{self.path} ¶{self.line_start}-{self.line_end}"
+        return f"{self.path}:{self.line_start}-{self.line_end}"
 
 
 def chunk_markdown(rel_path: str, source: str) -> list[Chunk]:
@@ -196,6 +348,24 @@ def chunk_markdown(rel_path: str, source: str) -> list[Chunk]:
     return chunks
 
 
+def chunk_view(rel_path: str, view: DocView) -> list[Chunk]:
+    """Chunk any view. PDF chunks never cross a page, so a citation names one page."""
+    if view.kind != "pdf":
+        return chunk_markdown(rel_path, "\n".join(view.pages[0]))
+    chunks: list[Chunk] = []
+    for page_no, page in enumerate(view.pages, start=1):
+        lines = list(page)
+        for s, e in _split_section(lines, 1, len(lines)):
+            text = "\n".join(lines[s - 1 : e])
+            if len(text.strip()) < MIN_CHUNK_CHARS:
+                continue
+            chunks.append(Chunk(
+                chunk_id=f"{rel_path}#p{page_no}:{s}-{e}", path=rel_path, heading="",
+                line_start=s, line_end=e, text=text, page=page_no,
+            ))
+    return chunks
+
+
 def _split_section(lines: list[str], start: int, end: int) -> list[tuple[int, int]]:
     """
     Cut [start, end] (1-based, inclusive) into spans of at most MAX_CHUNK_LINES.
@@ -243,16 +413,20 @@ class FileRecord:
     @classmethod
     def parse(cls, rel: str, path: Path, stamp: tuple[int, int]) -> "FileRecord":
         try:
-            source = read_markdown(path)
-        except (UnicodeDecodeError, OSError) as exc:
+            view = load_view(path)
+        except (UnicodeDecodeError, OSError, ValueError, MissingDependency) as exc:
             # keep the stamp, so an unreadable file is not retried on every refresh
             return cls(stamp=stamp, error=f"{type(exc).__name__}: {exc}")
-        chunks = tuple(chunk_markdown(rel, source))
+        chunks = tuple(chunk_view(rel, view))
+        links: tuple[str, ...] = ()
+        if view.kind == "markdown":                  # [[wikilinks]] are a Markdown convention
+            source = "\n".join(view.pages[0])
+            links = tuple(sorted({t.strip() for t in _WIKILINK.findall(source) if t.strip()}))
         return cls(
             stamp=stamp,
             chunks=chunks,
             term_freqs=tuple(dict(Counter(tokenize(_index_text(c)))) for c in chunks),
-            links=tuple(sorted({t.strip() for t in _WIKILINK.findall(source) if t.strip()})),
+            links=links,
         )
 
     def to_json(self) -> dict:
@@ -380,7 +554,7 @@ class DocsIndex:
             previous = {} if force else (self._snap.files or self._load_cache())
             files: dict[str, FileRecord] = {}
             reparsed = reused = 0
-            for path in iter_markdown_files(self.root):
+            for path in iter_corpus_files(self.root):
                 stamp = _stamp(path)
                 if stamp is None:                 # vanished mid-walk
                     continue
@@ -419,7 +593,7 @@ class DocsIndex:
         self._last_sweep = time.monotonic()
         current = {
             p.relative_to(self.root).as_posix(): _stamp(p)
-            for p in iter_markdown_files(self.root)
+            for p in iter_corpus_files(self.root)
         }
         if current == self._snap.stamps():
             return False
@@ -478,8 +652,10 @@ class DocsIndex:
                 "chunk_id": c.chunk_id,
                 "path": c.path,
                 "heading": c.heading,
+                "page": c.page,
                 "line_start": c.line_start,
                 "line_end": c.line_end,
+                "cite": c.cite,
                 "score": round(score, 4),
                 "text": c.text,
             }
@@ -495,18 +671,35 @@ class DocsIndex:
             raise FileNotFoundError(rel_path)
         return candidate
 
-    def read_span(self, rel_path: str, line_start: int, line_end: int) -> dict:
+    def read_span(self, rel_path: str, line_start: int, line_end: int,
+                  page: int | None = None) -> dict:
+        """
+        Read lines back from the same view the index was built from. For a PDF,
+        `page` is required and the lines are within that page.
+        """
         path = self.resolve(rel_path)
-        lines = read_markdown(path).split("\n")
+        view = _cached_view(str(path), _stamp(path))
+        if view.kind == "pdf":
+            if page is None:
+                raise PageRequired(f"{rel_path} is a PDF: pass page (1-{len(view.pages)})")
+            if not 1 <= page <= len(view.pages):
+                raise PageOutOfRange(f"{rel_path} has {len(view.pages)} pages, asked for {page}")
+            lines = view.pages[page - 1]
+        else:
+            if page is not None:
+                raise PageOutOfRange(f"page applies only to PDFs; {rel_path} is {view.kind}")
+            lines = view.pages[0]
         start = max(1, int(line_start))
         end = min(len(lines), int(line_end))
         if end < start:
             raise InvalidSpan(f"empty span {line_start}-{line_end}")
         return {
             "path": rel_path,
+            "page": page,
             "line_start": start,
             "line_end": end,
             "total_lines": len(lines),
+            "total_pages": len(view.pages),
             "text": "\n".join(lines[start - 1 : end]),
         }
 

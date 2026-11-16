@@ -1,26 +1,29 @@
 # docs-cite-mcp
 
-An MCP server that lets a coding agent search a markdown documentation tree and
-cite exactly where each answer came from.
+An MCP server that lets a coding agent search a documentation tree of Markdown,
+PDF and Word files and cite exactly where each answer came from.
 
-Search returns `path` + `line_start` + `line_end` for every passage, and
-`read_span` reads that exact range back out of the file. An agent using this can
-show its source instead of producing an answer from context.
+Search returns `path` + `line_start` + `line_end` for every passage (plus `page`
+for a PDF), and `read_span` reads that exact range back out of the file. An agent
+using this can show its source instead of producing an answer from context.
 
-Works on any directory of `.md` files: a project's `docs/`, a tree of engineering
-reports, or an Obsidian vault.
+Works on any directory of `.md`, `.pdf` and `.docx` files: a project's `docs/`,
+a tree of engineering reports, or an Obsidian vault.
 
 ## Requirements
 
 - Python 3.10 or newer (required by the MCP SDK; macOS system Python is 3.9)
-- `mcp>=2,<3` — the only external dependency. Everything else is stdlib.
+- `mcp>=2,<3`
+- Optional: `pypdf` for PDF and `python-docx` for Word (BSD and MIT licensed).
+  Without them those files are listed in `reindex`'s `files_skipped` and
+  Markdown works as before; the Markdown path is stdlib-only.
 
 ## Quickstart
 
 ```bash
 python3.11 -m venv .venv          # any interpreter >= 3.10
 .venv/bin/pip install --upgrade pip
-.venv/bin/pip install "mcp>=2,<3"
+.venv/bin/pip install -r requirements.txt
 
 .venv/bin/python test_index.py    # verifies the citation invariant
 .venv/bin/python test_server.py   # verifies the tool contract through an MCP client
@@ -30,6 +33,7 @@ python3.11 -m venv .venv          # any interpreter >= 3.10
 
 # the agent loop end to end, over stdio: search, cite, read each span back
 .venv/bin/python examples/cite_and_verify.py "what is the BM25 baseline NDCG"
+.venv/bin/python examples/cite_and_verify.py "how far did median latency fall"   # PDF
 ```
 
 Register with Claude Code:
@@ -51,8 +55,8 @@ Then, in Claude Code: *"search the docs for the BM25 baseline and cite the lines
 
 | Tool | Arguments | Returns | Hints |
 |---|---|---|---|
-| `search_notes` | `query`, `k` (1-20), `max_per_doc` (default 2) | passages with `path`, `heading`, `line_start`, `line_end`, `score` | read-only |
-| `read_span` | `path`, `line_start`, `line_end` (≥ 1, ≤ 400 lines) | the exact lines, for verifying a citation | read-only |
+| `search_notes` | `query`, `k` (1-20), `max_per_doc` (default 2) | passages with `path`, `heading`, `page`, `line_start`, `line_end`, `cite`, `score` | read-only |
+| `read_span` | `path`, `line_start`, `line_end` (≥ 1, ≤ 400 lines), `page` (PDFs) | the exact lines, for verifying a citation | read-only |
 | `list_backlinks` | `note` (name or path) | paths of documents whose `[[wikilinks]]` point at it | read-only |
 | `reindex` | `force` | rescans; only changed files are reparsed | writes the cache, non-destructive |
 
@@ -75,13 +79,38 @@ Errors are reported in two layers:
 | `invalid_span` | `line_end` is before `line_start` |
 | `path_outside_root` | path resolves outside `DOCS_ROOT` |
 | `not_found` | no such file under `DOCS_ROOT` |
-| `unreadable` | file exists but is not valid UTF-8 or cannot be read |
+| `page_required` | `read_span` on a PDF without a `page` |
+| `page_out_of_range` | the PDF has no such page, or `page` was given for a non-PDF file |
+| `unsupported_format` | not a `.md`, `.pdf` or `.docx` file |
+| `missing_dependency` | `pypdf` / `python-docx` is not installed for this format |
+| `no_text_layer` | a PDF with no extractable text, typically a scan |
+| `unreadable` | bad UTF-8, a corrupt or password-protected document, or permissions |
 | `internal_error` | unexpected failure; `detail` carries the exception |
 
 `test_server.py` checks the schemas, the hints and each error code through a real
 MCP client session.
 
 ## How it works
+
+### Formats and what a line number means
+
+Every format is first read into a *view*, a list of lines. Indexing and
+`read_span` both read the view through the same function, so a citation
+round-trips for every format, not only Markdown:
+
+| Format | A citation looks like | A "line" is |
+|---|---|---|
+| Markdown | `guides/indexing.md:3-8` | a line of the file |
+| PDF | `reports/latency-review.pdf p.1:1-4` | a line of that page's extracted text; chunks never cross a page |
+| Word | `guides/deployment-runbook.docx ¶3-5` | a block: one paragraph, or one table row rendered as `\| a \| b \|` |
+
+Word `Heading N` and `Title` styles become the breadcrumb, so a Word hit says
+which section it came from. Body text that happens to start with `#` is escaped,
+so only the document's real styles create sections. Scanned PDFs (no text
+layer), corrupt or password-protected files, and Word lock files are reported in
+`files_skipped` rather than indexed as empty.
+
+### Chunking and ranking
 
 Documents are split on markdown headings, then on length. A `#` inside a fenced
 code block is not a heading, so a shell or Python comment does not start a new
@@ -179,9 +208,17 @@ default for that reason.
 - **Relevance is labelled per document.** The gold format names files, not line
   spans, so the eval cannot tell whether the cited passage within a correct file
   is the one that answers the question.
-- **The quality gate is only as broad as its gold set.** CI gates on seven
-  queries over three sample documents, which catches gross regressions but
-  cannot resolve small ranking changes.
+- **The quality gate is only as broad as its gold set.** CI gates on ten
+  queries over five sample documents (Markdown, PDF, Word), which catches gross
+  regressions but cannot resolve small ranking changes. The ranking decisions
+  above were made on the 40-query set, which is Markdown only.
+- **PDF line numbers are of the extracted text.** They match what `read_span`
+  returns, not necessarily the visual lines on the page: multi-column layouts,
+  running headers and footers come out in pypdf's reading order. There is no
+  OCR, so scanned PDFs are skipped.
+- **Word citations are block numbers.** Word does not display them; the `cite`
+  string and breadcrumb are how a person finds the passage. Text boxes,
+  footnotes and comments are not extracted, and legacy `.doc` is not supported.
 - **Lexical only.** No dense retrieval, so paraphrases and cross-language queries
   miss.
 - **The whole index lives in memory.** Fine for thousands of documents; untested
@@ -200,7 +237,7 @@ This one is narrower on purpose:
   tool to verify it.
 - **Retrieval quality is measured.** The gold set and corpus in this repo are
   public, so the numbers are reproducible.
-- **Not Obsidian-specific.** Reads any markdown tree off disk. No plugin, no
+- **Not Obsidian-specific.** Reads any tree of Markdown, PDF and Word files off disk. No plugin, no
   running app, no Node.
 
 ## Do not commit private corpora

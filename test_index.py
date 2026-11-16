@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -244,6 +245,112 @@ def system_checks() -> None:
             shutil.rmtree(path, ignore_errors=True)
 
 
+def format_checks() -> None:
+    """PDF and Word: the same round-trip invariant, plus the ways those files go wrong."""
+    try:
+        import docx  # noqa: F401
+        import pypdf  # noqa: F401
+    except ImportError:
+        print("\nPDF / Word  SKIPPED (pip install pypdf python-docx to run)")
+        return
+    from docs_index import PageOutOfRange, PageRequired
+    from sample_files import write_docx, write_pdf
+
+    try:
+        print("\nPDF: citations are page + line, and round-trip")
+        root = corpus({"notes.md": "# Notes\nplain markdown sitting next to binaries\n"})
+        long_page = [f"row {i} of the appendix table" for i in range(55)]
+        write_pdf(root / "report.pdf", [
+            ["Quarterly Report", "Revenue grew in the alpha region."],
+            ["Appendix", *long_page],
+            ["Closing remarks about the bravo initiative."],
+        ])
+        idx = DocsIndex(root)
+        stats = idx.build()
+        pdf_chunks = [c for c in idx.chunks if c.path == "report.pdf"]
+        check("every PDF chunk names its page", all(c.page for c in pdf_chunks))
+        check("a long page is split, and no chunk crosses a page",
+              [c.page for c in pdf_chunks] == [1, 2, 2, 3], f"-> {[c.cite for c in pdf_chunks]}")
+        bad = [c.cite for c in pdf_chunks
+               if idx.read_span(c.path, c.line_start, c.line_end, c.page)["text"] != c.text]
+        check("every PDF span reproduces its chunk text", not bad, f"-> {bad}")
+        hit = idx.search("bravo initiative")[0]
+        check("search cites page and lines", hit["cite"] == "report.pdf p.3:1-1", f"-> {hit['cite']}")
+        for call, exc_type, label in (
+            (lambda: idx.read_span("report.pdf", 1, 2), PageRequired, "PDF without page"),
+            (lambda: idx.read_span("report.pdf", 1, 2, page=9), PageOutOfRange, "page past the end"),
+            (lambda: idx.read_span("notes.md", 1, 2, page=1), PageOutOfRange, "page on Markdown"),
+        ):
+            try:
+                call()
+                check(f"rejects {label}", False, "-> no error")
+            except exc_type:
+                check(f"rejects {label}", True)
+        check("markdown beside binaries is unaffected", stats["notes_indexed"] == 2)
+
+        write_pdf(root / "report.pdf", [["Quarterly Report", "Revenue now grew in the charlie region."]])
+        hit = idx.search("charlie region")[0]
+        span = idx.read_span(hit["path"], hit["line_start"], hit["line_end"], hit["page"])
+        check("an edited PDF is re-extracted before it is cited", span["text"] == hit["text"])
+
+        print("\nPDF: files that cannot be cited are reported, not crashed on")
+        root = corpus({"ok.md": "# Fine\nthis file indexes normally\n"})
+        write_pdf(root / "scan.pdf", [[], []])                 # pages with no text layer
+        (root / "broken.pdf").write_bytes(b"%PDF-1.4 this is not really a pdf")
+        idx = DocsIndex(root)
+        stats = idx.build()
+        check("scanned and corrupt PDFs land in files_skipped",
+              stats["files_skipped"] == ["broken.pdf", "scan.pdf"] and stats["notes_indexed"] == 1,
+              f"-> {stats['files_skipped']}")
+        reasons = {rel: rec.error for rel, rec in idx._snap.files.items() if rec.error}
+        check("a scan is reported as having no text layer",
+              (reasons.get("scan.pdf") or "").startswith("NoTextLayer"), f"-> {reasons}")
+
+        print("\nWord: blocks are lines, styles are headings, tables are rows")
+        root = corpus({})
+        write_docx(root / "runbook.docx", [
+            ("h", 1, "Runbook"),
+            ("p", "Intro paragraph for the service."),
+            ("h", 2, "Rollback"),
+            ("p", "Reinstall the delta release tag, then restart."),
+            ("p", "# not a heading, just body text that starts with a hash"),
+            ("h", 2, "Matrix"),
+            ("table", [["Python", "Status"], ["3.10", "echo tested"]]),
+        ])
+        (root / "~$runbook.docx").write_bytes(b"lock file")
+        idx = DocsIndex(root)
+        stats = idx.build()
+        docx_chunks = [c for c in idx.chunks if c.path == "runbook.docx"]
+        check("Heading styles become the breadcrumb",
+              [c.heading for c in docx_chunks] == ["Runbook", "Runbook > Rollback", "Runbook > Matrix"],
+              f"-> {[c.heading for c in docx_chunks]}")
+        bad = [c.cite for c in docx_chunks
+               if idx.read_span(c.path, c.line_start, c.line_end)["text"] != c.text]
+        check("every Word span reproduces its chunk text", not bad, f"-> {bad}")
+        hit = idx.search("echo tested")[0]
+        check("table rows are searchable and cited by block",
+              hit["cite"] == "runbook.docx ¶6-8" and "| 3.10 | echo tested |" in hit["text"],
+              f"-> {hit['cite']} {hit['text']!r}")
+        check("body text starting with # is escaped, not promoted to a heading",
+              "\\# not a heading" in docx_chunks[1].text, f"-> {docx_chunks[1].text!r}")
+        check("Word lock files (~$name.docx) are not documents",
+              stats["notes_indexed"] == 1 and not stats["files_skipped"], f"-> {stats}")
+
+        print("\nwithout the optional libraries, Markdown still works")
+        root = corpus({"a.md": "# A\nfoxtrot golf markdown content\n"})
+        write_pdf(root / "b.pdf", [["foxtrot golf in a pdf"]])
+        with mock.patch.dict(sys.modules, {"pypdf": None}):
+            idx = DocsIndex(root)
+            stats = idx.build()
+        check("PDF is skipped with the reason, Markdown is indexed",
+              stats["files_skipped"] == ["b.pdf"] and stats["notes_indexed"] == 1
+              and "pip install pypdf" in (idx._snap.files["b.pdf"].error or ""),
+              f"-> {stats}")
+    finally:
+        for path in _scratch:
+            shutil.rmtree(path, ignore_errors=True)
+
+
 def main() -> int:
     root = Path(tempfile.mkdtemp(prefix="docs_"))
     try:
@@ -337,6 +444,7 @@ def main() -> int:
               [c.heading for c in unclosed] == ["Top"], f"-> {[c.heading for c in unclosed]}")
 
         system_checks()
+        format_checks()
 
         print()
         if failures:
