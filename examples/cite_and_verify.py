@@ -49,7 +49,9 @@ async def main(query: str, docs: Path, k: int) -> int:
         verified = 0
         for i, hit in enumerate(found["results"], start=1):
             print(f"[{i}] {hit['cite']}  ({hit['heading'] or 'no heading'}, score {hit['score']})")
-            args = {"path": hit["path"], "line_start": hit["line_start"], "line_end": hit["line_end"]}
+            # version makes the check fail loudly if the file changed since the search
+            args = {"path": hit["path"], "line_start": hit["line_start"],
+                    "line_end": hit["line_end"], "version": hit["version"]}
             if hit["page"] is not None:                 # PDF citations are page + lines
                 args["page"] = hit["page"]
             span = (await client.call_tool("read_span", args)).structured_content
@@ -58,6 +60,9 @@ async def main(query: str, docs: Path, k: int) -> int:
                 span["text"].startswith(hit["text"]) if hit["truncated"] else span["text"] == hit["text"]
             )
             verified += bool(ok)
+            if span.get("error") == "stale_citation":
+                print("    STALE: the file changed after the search; search again")
+                continue
             first_line = next((ln for ln in span.get("text", "").splitlines() if ln.strip()), "")
             print(f"    {'verified' if ok else 'MISMATCH'}: {first_line[:90]}")
 

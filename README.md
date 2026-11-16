@@ -67,7 +67,7 @@ Then, in Claude Code: *"search the docs for the BM25 baseline and cite the lines
 | Tool | Arguments | Returns | Hints |
 |---|---|---|---|
 | `search_notes` | `query`, `k` (1-20), `max_per_doc` (default 2), `mode` (`hybrid` / `lexical` / `dense`) | passages with `path`, `heading`, `page`, `line_start`, `line_end`, `cite`, `score`, `lexical_rank`, `dense_rank`; and the `mode` used | read-only |
-| `read_span` | `path`, `line_start`, `line_end` (≥ 1, ≤ 400 lines), `page` (PDFs) | the exact lines, for verifying a citation | read-only |
+| `read_span` | `path`, `line_start`, `line_end` (≥ 1, ≤ 400 lines), `page` (PDFs), `version` (from the hit) | the exact lines, for verifying a citation; `stale_citation` if the file changed since the search | read-only |
 | `list_backlinks` | `note` (name or path) | paths of documents whose `[[wikilinks]]` point at it | read-only |
 | `reindex` | `force` | rescans; only changed files are reparsed | writes the cache, non-destructive |
 
@@ -90,6 +90,7 @@ Errors are reported in two layers:
 | `invalid_span` | `line_end` is before `line_start` |
 | `path_outside_root` | path resolves outside `DOCS_ROOT` |
 | `not_found` | no such file under `DOCS_ROOT` |
+| `stale_citation` | the file changed after the search that cited it; search again |
 | `page_required` | `read_span` on a PDF without a `page` |
 | `page_out_of_range` | the PDF has no such page, or `page` was given for a non-PDF file |
 | `unsupported_format` | not a `.md`, `.pdf` or `.docx` file |
@@ -99,7 +100,9 @@ Errors are reported in two layers:
 | `internal_error` | unexpected failure; `detail` carries the exception |
 
 `test_server.py` checks the schemas, the hints and each error code through a real
-MCP client session.
+MCP client session, including the full recovery loop: search, edit the file,
+`read_span` with the old version fails as `stale_citation`, search again, and
+the new citation verifies.
 
 ## How it works
 
@@ -167,9 +170,16 @@ A line span is only a citation if it still matches the file when someone checks
 it. The index keeps that true while a server is running:
 
 - **Fresh.** Before returning hits, a search re-stats the files it is about to
-  cite and rebuilds if any changed, so a span never points into an older version
-  of a file. Added and deleted files are picked up by a stat sweep at most every
-  two seconds. Calling `reindex` is never required for correctness.
+  cite and rebuilds if any changed, so a span is correct when it is returned.
+  Added and deleted files are picked up by a stat sweep at most every two
+  seconds. Calling `reindex` is never required for correctness.
+- **Checkable after the fact.** A file can still change between the search and
+  the `read_span` that checks it, and then the same line numbers hold other
+  text. Every hit carries the file's `version`, a hash of the text it was cited
+  from; `read_span` given that version returns `stale_citation` instead of
+  shifted lines, and the agent searches again. The hash is of content, not
+  mtime, so touching a file does not invalidate citations. Without `version`,
+  `read_span` reads the current lines unchecked, as older callers expect.
 - **Atomic.** Each build produces an immutable snapshot and swaps it in with one
   assignment. A search holds one snapshot for its whole run, so a concurrent
   `reindex` cannot give it chunks and statistics that disagree.

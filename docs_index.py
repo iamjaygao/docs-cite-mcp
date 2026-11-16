@@ -52,7 +52,7 @@ from typing import Any
 
 # Bump whenever chunking, tokenizing or the cache layout changes: caches written
 # under another version are discarded instead of silently reused.
-CACHE_VERSION = 4
+CACHE_VERSION = 5
 SUPPORTED_SUFFIXES = {".md", ".pdf", ".docx"}
 SKIP_DIRS = {".obsidian", ".trash", ".git", "node_modules", ".DS_Store"}
 MAX_CHUNK_LINES = 40          # long sections get split further, at a paragraph break
@@ -78,6 +78,10 @@ class PathOutsideRoot(ValueError):
 
 class InvalidSpan(ValueError):
     """A requested line range is empty or inverted."""
+
+
+class StaleCitation(ValueError):
+    """The file changed after it was cited: the cited lines may now hold other text."""
 
 
 class PageRequired(ValueError):
@@ -183,6 +187,20 @@ def load_view(path: Path) -> DocView:
 def _cached_view(path: str, stamp: tuple[int, int] | None) -> DocView:
     # keyed on the stamp, so an edited file is never served from the cache
     return load_view(Path(path))
+
+
+def view_version(view: DocView) -> str:
+    """
+    Content hash of a view: what a citation was made against. A hash rather
+    than mtime, so touching a file without changing it does not invalidate
+    citations, while any edit to the text does.
+    """
+    import hashlib
+    h = hashlib.sha256(view.kind.encode())
+    for page in view.pages:
+        h.update(b"\x0c")
+        h.update("\n".join(page).encode("utf-8"))
+    return h.hexdigest()[:16]
 
 
 def document_text(path: Path) -> str:
@@ -428,6 +446,7 @@ class FileRecord:
     links: tuple[str, ...] = ()                   # outgoing [[wikilink]] targets
     error: str | None = None                      # set when the file could not be read
     vectors: Any = None                           # (len(chunks), dim) array, or None if lexical-only
+    version: str = ""                             # view_version() of the text the chunks came from
 
     @classmethod
     def parse(cls, rel: str, path: Path, stamp: tuple[int, int]) -> "FileRecord":
@@ -446,6 +465,7 @@ class FileRecord:
             chunks=chunks,
             term_freqs=tuple(dict(Counter(tokenize(_index_text(c)))) for c in chunks),
             links=links,
+            version=view_version(view),
         )
 
     def to_json(self) -> dict:
@@ -454,6 +474,7 @@ class FileRecord:
             "chunks": [{**asdict(c), "tf": tf} for c, tf in zip(self.chunks, self.term_freqs)],
             "links": list(self.links),
             "error": self.error,
+            "version": self.version,
         }
         if self.vectors is not None:
             from dense import pack
@@ -480,6 +501,7 @@ class FileRecord:
             links=tuple(raw["links"]),
             error=raw.get("error"),
             vectors=vectors,
+            version=raw["version"],
         )
 
 
@@ -779,6 +801,7 @@ class DocsIndex:
                 "line_start": c.line_start,
                 "line_end": c.line_end,
                 "cite": c.cite,
+                "version": snap.files[c.path].version,   # pass back to read_span
                 "score": round(score, 4),
                 **ranks,
                 "text": c.text,
@@ -796,13 +819,25 @@ class DocsIndex:
         return candidate
 
     def read_span(self, rel_path: str, line_start: int, line_end: int,
-                  page: int | None = None) -> dict:
+                  page: int | None = None, version: str | None = None) -> dict:
         """
         Read lines back from the same view the index was built from. For a PDF,
         `page` is required and the lines are within that page.
+
+        Search freshness guarantees a citation is right when it is returned; a
+        file can still change before the citation is checked, and then the same
+        line numbers hold other text. Pass the hit's `version` and a changed
+        file raises StaleCitation instead of returning shifted lines.
+        Without `version` the current lines are returned unchecked, as before.
         """
         path = self.resolve(rel_path)
         view = _cached_view(str(path), _stamp(path))
+        current = view_version(view)
+        if version is not None and version != current:
+            raise StaleCitation(
+                f"{rel_path} changed after it was cited (cited version {version}, "
+                f"now {current}); search again for a fresh citation"
+            )
         if view.kind == "pdf":
             if page is None:
                 raise PageRequired(f"{rel_path} is a PDF: pass page (1-{len(view.pages)})")
@@ -824,6 +859,7 @@ class DocsIndex:
             "line_end": end,
             "total_lines": len(lines),
             "total_pages": len(view.pages),
+            "version": current,
             "text": "\n".join(lines[start - 1 : end]),
         }
 

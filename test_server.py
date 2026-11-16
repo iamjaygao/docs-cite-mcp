@@ -183,6 +183,42 @@ async def main() -> int:
         check("every code exercised here is in ERROR_CODES",
               codes_used <= set(server.ERROR_CODES))
 
+        print("\nsearch -> file edited -> verify fails as stale -> search again -> verify")
+        version_schema = tools["read_span"].input_schema["properties"].get("version", {})
+        check("read_span publishes an optional version",
+              version_schema and "version" not in tools["read_span"].input_schema.get("required", []))
+        _, found = await call(client, "search_notes", {"query": "index cache full chunk text", "k": 1})
+        hit = found["results"][0]
+        cited = {"path": hit["path"], "line_start": hit["line_start"],
+                 "line_end": hit["line_end"], "version": hit["version"]}
+        _, span = await call(client, "read_span", cited)
+        check("a fresh citation verifies with its version", span.get("text") == hit["text"],
+              f"-> {span}")
+
+        target = CORPUS / hit["path"]                   # someone edits the file meanwhile
+        target.write_text("> Note: this guide was revised.\n\n" + target.read_text(encoding="utf-8"),
+                          encoding="utf-8")
+        result, span = await call(client, "read_span", cited)
+        check("the old citation now fails with stale_citation",
+              not result.is_error and span.get("ok") is False and span.get("error") == "stale_citation",
+              f"-> {span}")
+
+        _, found = await call(client, "search_notes", {"query": "index cache full chunk text", "k": 1})
+        new = found["results"][0]
+        check("searching again moves the citation with the text",
+              new["path"] == hit["path"] and new["line_start"] == hit["line_start"] + 2
+              and new["version"] != hit["version"], f"-> {new['cite']} (was {hit['cite']})")
+        _, span = await call(client, "read_span", {
+            "path": new["path"], "line_start": new["line_start"],
+            "line_end": new["line_end"], "version": new["version"]})
+        check("the new citation verifies", span.get("ok") and span.get("text") == new["text"],
+              f"-> {span}")
+        legacy = {k: v for k, v in cited.items() if k != "version"}
+        _, span = await call(client, "read_span", legacy)
+        check("read_span without version still works (old callers unaffected)",
+              span.get("ok") is True and span.get("version") == new["version"], f"-> {span}")
+        check("stale_citation is a documented code", "stale_citation" in server.ERROR_CODES)
+
     print()
     if failures:
         print(f"{len(failures)} FAILED: {', '.join(failures)}")

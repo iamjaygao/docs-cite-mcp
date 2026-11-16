@@ -53,6 +53,7 @@ from docs_index import (
     PageOutOfRange,
     PageRequired,
     PathOutsideRoot,
+    StaleCitation,
     UnreadableDocument,
     UnsupportedFormat,
 )
@@ -70,6 +71,7 @@ ERROR_CODES = {
     "invalid_span": "line_end is before line_start, or the span is empty after clamping",
     "path_outside_root": "path resolves outside DOCS_ROOT",
     "not_found": "no such file under DOCS_ROOT",
+    "stale_citation": "the file changed after it was cited; search again for a fresh citation",
     "page_required": "read_span on a PDF needs a page",
     "page_out_of_range": "the PDF has no such page, or a page was given for a non-PDF file",
     "unsupported_format": "not a Markdown, PDF or Word (.docx) file",
@@ -80,7 +82,7 @@ ERROR_CODES = {
     "internal_error": "unexpected failure; detail carries the exception text",
 }
 
-mcp = MCPServer("docs-cite", version="0.4.0")
+mcp = MCPServer("docs-cite", version="0.5.0")
 
 # SDK v2 runs synchronous handlers on worker threads, so tools execute
 # concurrently. The index makes that safe itself (builds are serialised, and a
@@ -121,6 +123,8 @@ def _from_exception(exc: Exception) -> dict:
         return _error("invalid_span", str(exc))
     if isinstance(exc, FileNotFoundError):
         return _error("not_found", str(exc))
+    if isinstance(exc, StaleCitation):
+        return _error("stale_citation", str(exc))
     if isinstance(exc, PageRequired):
         return _error("page_required", str(exc))
     if isinstance(exc, PageOutOfRange):
@@ -152,6 +156,7 @@ class SearchHit(TypedDict):
     line_start: int             # within `page` for a PDF; a block number for Word
     line_end: int
     cite: str                   # "a.md:3-8", "b.pdf p.2:1-4", "c.docx ¶3-5"
+    version: str                # content hash of the file as cited; pass to read_span
     score: float                # BM25 (lexical), cosine (dense), or RRF (hybrid)
     lexical_rank: int | None    # position in the BM25 ranking, if it ranked at all
     dense_rank: int | None      # position in the vector ranking; None when lexical-only
@@ -174,6 +179,7 @@ class SpanResult(_Status):
     line_end: NotRequired[int]
     total_lines: NotRequired[int]   # lines in the file, or in the page for a PDF
     total_pages: NotRequired[int]   # 1 for Markdown and Word
+    version: NotRequired[str]       # content hash of the file as read now
     text: NotRequired[str]
 
 
@@ -217,11 +223,12 @@ def search_notes(
     """
     Search Markdown, PDF and Word docs; return passages with their exact source location.
 
-    Every hit includes `path`, `line_start`, `line_end`, `page` (PDFs only) and
-    a ready-made `cite` string. Cite those rather than paraphrasing from memory;
-    call read_span with the same path, lines and page to verify a passage before
-    relying on it. Snippets longer than 1200 characters come back with
-    truncated=true. `mode` in the result says which retrieval was used.
+    Every hit includes `path`, `line_start`, `line_end`, `page` (PDFs only), a
+    ready-made `cite` string and the file's `version`. Cite those rather than
+    paraphrasing from memory; call read_span with the same path, lines, page and
+    version to verify a passage before relying on it. Snippets longer than 1200
+    characters come back with truncated=true. `mode` in the result says which
+    retrieval was used.
     """
     query = query.strip()
     if not query:
@@ -244,7 +251,8 @@ def search_notes(
         "mode": used,
         "returned": len(results),
         "results": results,
-        "note": "cite each hit's `cite`; call read_span (with page for PDFs) to verify",
+        "note": "cite each hit's `cite`; verify with read_span, passing its page (PDFs) "
+                "and version; on stale_citation, search again",
     }
 
 
@@ -256,6 +264,12 @@ def read_span(
     page: Annotated[int | None, Field(
         ge=1, description="PDF page, 1-based. Required for PDFs; omit for Markdown and Word.",
     )] = None,
+    version: Annotated[str | None, Field(
+        min_length=1,
+        description="The `version` from the search hit being checked. If the file has changed "
+                    "since, the call fails with stale_citation instead of returning lines that "
+                    "may now hold other text. Omit to read the current lines unchecked.",
+    )] = None,
 ) -> SpanResult:
     """
     Read an exact line range from a document, so a cited passage can be checked.
@@ -263,7 +277,8 @@ def read_span(
     Lines are those search_notes reported: file lines for Markdown, lines within
     `page` for a PDF, blocks (paragraphs and table rows) for Word. At most 400
     lines per call. A span running past the end is clamped to the last line;
-    total_lines reports the length.
+    total_lines reports the length. Pass the hit's `version` when verifying a
+    citation; on stale_citation, search again.
     """
     if line_end < line_start:
         return _error("invalid_span", f"line_end {line_end} is before line_start {line_start}")
@@ -273,7 +288,7 @@ def read_span(
             f"requested {line_end - line_start + 1} lines, max {MAX_SPAN_LINES}",
         )
     try:
-        return {"ok": True, **get_index().read_span(path, line_start, line_end, page)}
+        return {"ok": True, **get_index().read_span(path, line_start, line_end, page, version)}
     except Exception as exc:
         return _from_exception(exc)
 

@@ -99,6 +99,40 @@ def system_checks() -> None:
         (root / "b.md").unlink()
         check("deleted file stops being returned", idx.search("hotel india") == [])
 
+        print("\nstale citations: an edit between search and read_span is caught")
+        from docs_index import StaleCitation
+        root = corpus({"run.md": "# Runbook\nIntro line.\n\n## Rollback\nReinstall the previous tag, then restart.\n"})
+        idx = DocsIndex(root, refresh_interval=3600)
+        idx.build()
+        hit = idx.search("reinstall previous tag")[0]
+        args = (hit["path"], hit["line_start"], hit["line_end"])
+        check("an unchanged file verifies with its version",
+              idx.read_span(*args, version=hit["version"])["text"] == hit["text"])
+        check("the version survives a restart (loaded from cache)",
+              DocsIndex(root).build() and DocsIndex(root).search("reinstall previous tag")[0]["version"]
+              == hit["version"])
+        later = os.stat(root / "run.md").st_mtime + 10
+        os.utime(root / "run.md", (later, later))
+        check("touching a file without editing it keeps citations valid",
+              idx.read_span(*args, version=hit["version"])["text"] == hit["text"])
+        (root / "run.md").write_text(
+            "# Runbook\nIntro line.\nNEW: never roll back on Fridays.\n\n## Rollback\n"
+            "Reinstall the previous tag, then restart.\n", encoding="utf-8")
+        try:
+            idx.read_span(*args, version=hit["version"])
+            check("an edited file raises StaleCitation", False, "-> shifted lines returned silently")
+        except StaleCitation:
+            check("an edited file raises StaleCitation", True)
+        unchecked = idx.read_span(*args)
+        check("without version, read_span still answers (backward compatible)",
+              unchecked["text"] != hit["text"] and unchecked["version"] != hit["version"])
+        fresh = idx.search("reinstall previous tag")[0]
+        check("searching again yields a citation that verifies",
+              fresh["line_start"] == hit["line_start"] + 1
+              and idx.read_span(fresh["path"], fresh["line_start"], fresh["line_end"],
+                                version=fresh["version"])["text"] == fresh["text"],
+              f"-> {fresh['cite']}")
+
         print("\ncache versioning")
         root = corpus({"a.md": "# A\nsome text here for the chunk\n"})
         DocsIndex(root).build()
@@ -253,7 +287,7 @@ def format_checks() -> None:
     except ImportError:
         print("\nPDF / Word  SKIPPED (pip install pypdf python-docx to run)")
         return
-    from docs_index import PageOutOfRange, PageRequired
+    from docs_index import PageOutOfRange, PageRequired, StaleCitation
     from sample_files import write_docx, write_pdf
 
     try:
@@ -288,10 +322,16 @@ def format_checks() -> None:
                 check(f"rejects {label}", True)
         check("markdown beside binaries is unaffected", stats["notes_indexed"] == 2)
 
+        old = idx.search("bravo initiative")[0]
         write_pdf(root / "report.pdf", [["Quarterly Report", "Revenue now grew in the charlie region."]])
         hit = idx.search("charlie region")[0]
         span = idx.read_span(hit["path"], hit["line_start"], hit["line_end"], hit["page"])
         check("an edited PDF is re-extracted before it is cited", span["text"] == hit["text"])
+        try:
+            idx.read_span(old["path"], 1, 1, page=1, version=old["version"])
+            check("a PDF citation made before the edit is stale", False, "-> no error")
+        except StaleCitation:
+            check("a PDF citation made before the edit is stale", True)
 
         print("\nPDF: files that cannot be cited are reported, not crashed on")
         root = corpus({"ok.md": "# Fine\nthis file indexes normally\n"})
