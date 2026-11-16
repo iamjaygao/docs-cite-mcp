@@ -110,13 +110,13 @@ def concentration(hits: list[dict], k: int) -> float:
 
 
 def run(index: DocsIndex, gold: list[dict], k: int, depth: int,
-        unit: str = "document", max_per_doc: int | None = None) -> dict:
+        unit: str = "document", max_per_doc: int | None = None, mode: str | None = None) -> dict:
     per_query = []
     for row in gold:
         relevant = set(row["relevant"])
         if not relevant:
             continue
-        hits = index.search(row["query"], k=depth, max_per_doc=max_per_doc)
+        hits = index.search(row["query"], k=depth, max_per_doc=max_per_doc, mode=mode)
         ranked = chunk_ranking(hits) if unit == "chunk" else dedup_paths(hits)
         per_query.append(
             {
@@ -202,9 +202,13 @@ def main() -> int:
     ap.add_argument("--unit", choices=["document", "chunk"], default="document",
                     help="document: dedup chunks to their file (retrieval quality). "
                          "chunk: score the list the agent actually sees (result crowding).")
+    ap.add_argument("--mode", choices=docs_index.MODES, default="lexical",
+                    help="retrieval mode; dense and hybrid need fastembed")
+    ap.add_argument("--embed-model", default=None,
+                    help="embedding model for dense/hybrid (default: dense.DEFAULT_MODEL)")
     ap.add_argument(
         "--compare",
-        help="A/B one knob, e.g. chunk_lines=20,40 -- reindexes and paired-bootstraps",
+        help="A/B one knob and paired-bootstrap it: chunk_lines=20,40 or mode=lexical,hybrid",
     )
     gate = ap.add_argument_group(
         "quality gate", "exit 1 if a metric falls below its floor -- lets CI fail on a retrieval regression"
@@ -225,28 +229,41 @@ def main() -> int:
         print("gold set is empty")
         return 1
 
+    def embedder_for(mode: str):
+        if mode == "lexical":
+            return None
+        from dense import DEFAULT_MODEL, FastEmbedder
+        return FastEmbedder(args.embed_model or DEFAULT_MODEL)
+
+    cache_dir = Path(".cache")
+    cache_dir.mkdir(exist_ok=True)
+
     if not args.compare:
-        index = DocsIndex(args.docs)
+        embedder = embedder_for(args.mode)
+        tag = (embedder.name if embedder else "lexical").replace("/", "_")
+        index = DocsIndex(args.docs, cache_path=cache_dir / f"eval_{tag}.json", embedder=embedder)
         index.build()
-        result = run(index, gold, args.k, args.depth, args.unit, args.max_per_doc)
+        result = run(index, gold, args.k, args.depth, args.unit, args.max_per_doc, args.mode)
         print(json.dumps({k: v for k, v in result.items() if k != "per_query"}, indent=2,
                          ensure_ascii=False))
         return check_floors(result, args)
 
     knob, raw = args.compare.split("=", 1)
-    if knob != "chunk_lines":
+    if knob not in ("chunk_lines", "mode"):
         print(f"unsupported knob: {knob}")
         return 1
-    left, right = (int(v) for v in raw.split(","))
+    left, right = raw.split(",")
 
     runs = {}
     for value in (left, right):
-        docs_index.MAX_CHUNK_LINES = value
-        cache_dir = Path(".cache")
-        cache_dir.mkdir(exist_ok=True)
-        index = DocsIndex(args.docs, cache_path=cache_dir / f"eval_index_{value}.json")
+        mode = value if knob == "mode" else args.mode
+        if knob == "chunk_lines":
+            docs_index.MAX_CHUNK_LINES = int(value)
+        embedder = embedder_for(mode)
+        index = DocsIndex(args.docs, cache_path=cache_dir / f"eval_{knob}_{value}.json",
+                          embedder=embedder)
         index.build(force=True)
-        runs[value] = run(index, gold, args.k, args.depth, args.unit, args.max_per_doc)
+        runs[value] = run(index, gold, args.k, args.depth, args.unit, args.max_per_doc, mode)
 
     for metric in (f"recall@{args.k}", f"ndcg@{args.k}"):
         key = "recall" if metric.startswith("recall") else "ndcg"
@@ -255,8 +272,8 @@ def main() -> int:
             [q[key] for q in runs[right]["per_query"]],
         )
         print(
-            f"{metric}: chunk_lines={left} {runs[left][metric]:.4f} -> "
-            f"chunk_lines={right} {runs[right][metric]:.4f}  {stats}"
+            f"{metric}: {knob}={left} {runs[left][metric]:.4f} -> "
+            f"{knob}={right} {runs[right][metric]:.4f}  {stats}"
         )
     return 0
 

@@ -346,6 +346,97 @@ def format_checks() -> None:
               stats["files_skipped"] == ["b.pdf"] and stats["notes_indexed"] == 1
               and "pip install pypdf" in (idx._snap.files["b.pdf"].error or ""),
               f"-> {stats}")
+        idx = DocsIndex(root)                          # same cache, pypdf now importable
+        stats = idx.build()
+        check("installing pypdf later indexes the PDF without touching the file",
+              stats["files_skipped"] == [] and stats["notes_indexed"] == 2, f"-> {stats}")
+        with mock.patch.dict(sys.modules, {"pypdf": None}):
+            idx = DocsIndex(root)                      # cache built *with* pypdf
+            stats = idx.build()
+            cited = [h["cite"] for h in idx.search("foxtrot golf", k=5)]
+        check("a cache built with pypdf never serves PDF citations it cannot verify",
+              stats["files_skipped"] == ["b.pdf"] and not any("b.pdf" in c for c in cited),
+              f"-> skipped {stats['files_skipped']} cited {cited}")
+    finally:
+        for path in _scratch:
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def dense_checks() -> None:
+    """
+    Hybrid retrieval plumbing, with a deterministic hashed stand-in for the
+    model: caching, incremental re-embedding, invalidation, fusion, the cap.
+    """
+    try:
+        import numpy as np
+        from dense import HashEmbedder
+    except ImportError:
+        print("\ndense / hybrid  SKIPPED (pip install fastembed to run)")
+        return
+    from docs_index import MissingDependency
+
+    class Counting(HashEmbedder):
+        """Counts passages embedded, so a test can prove the cache was used."""
+        def __init__(self, dim: int = 64):
+            super().__init__(dim)
+            self.passages = 0
+
+        def embed(self, texts, kind):
+            if kind == "passage":
+                self.passages += len(texts)
+            return super().embed(texts, kind)
+
+    try:
+        print("\nhybrid retrieval: vectors are cached, incremental, and versioned")
+        files = {f"doc{i}.md": f"# Doc {i}\nsierra tango topic number {i} here\n" for i in range(6)}
+        files["long.md"] = "# Long\n" + "\n\n".join(
+            f"## Part {i}\nuniform victor detail {i}" for i in range(10))
+        root = corpus(files)
+        emb = Counting()
+        idx = DocsIndex(root, embedder=emb, refresh_interval=3600)
+        stats = idx.build()
+        n_chunks = stats["chunks"]
+        check("first build embeds every chunk once",
+              stats["chunks_embedded"] == n_chunks == emb.passages, f"-> {stats}")
+        check("default mode is hybrid when a model is present", idx.default_mode == "hybrid")
+
+        hits = idx.search("sierra tango topic", k=5)
+        check("hybrid hits report both ranks",
+              all("lexical_rank" in h and "dense_rank" in h for h in hits) and hits[0]["dense_rank"])
+        capped = [h["path"] for h in idx.search("uniform victor detail", k=6, max_per_doc=2)]
+        check("max_per_doc holds after fusion", capped.count("long.md") <= 2, f"-> {capped}")
+
+        fresh = Counting()
+        again = DocsIndex(root, embedder=fresh, refresh_interval=3600)
+        stats = again.build()
+        check("a new process loads vectors from the cache instead of re-embedding",
+              stats["chunks_embedded"] == 0 and fresh.passages == 0, f"-> {stats}")
+        check("cached vectors are bit-identical to freshly computed ones",
+              np.array_equal(again._snap.matrix, idx._snap.matrix))
+        check("so rankings are identical across restarts",
+              [h["chunk_id"] for h in again.search("sierra tango topic", k=5)]
+              == [h["chunk_id"] for h in hits])
+
+        (root / "doc0.md").write_text("# Doc 0\nsierra tango rewritten for the test\n", encoding="utf-8")
+        stats = again.build()
+        check("an edited file re-embeds only its own chunks",
+              stats["chunks_embedded"] == 1, f"-> {stats['chunks_embedded']}")
+
+        other = Counting(dim=32)                           # "a different model"
+        stats = DocsIndex(root, embedder=other, refresh_interval=3600).build()
+        check("switching models discards the cached vectors",
+              stats["chunks_embedded"] == n_chunks, f"-> {stats['chunks_embedded']}")
+
+        lexical_only = DocsIndex(root, refresh_interval=3600)
+        lexical_only.build()
+        check("without a model the default mode is lexical", lexical_only.default_mode == "lexical")
+        try:
+            lexical_only.search("sierra", mode="dense")
+            check("mode=dense without a model is refused", False, "-> no error")
+        except MissingDependency:
+            check("mode=dense without a model is refused", True)
+        plain = lexical_only.search("sierra tango", k=3)
+        check("lexical results carry no dense rank", all(h["dense_rank"] is None for h in plain))
     finally:
         for path in _scratch:
             shutil.rmtree(path, ignore_errors=True)
@@ -445,6 +536,7 @@ def main() -> int:
 
         system_checks()
         format_checks()
+        dense_checks()
 
         print()
         if failures:

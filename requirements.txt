@@ -2,3 +2,5 @@ mcp>=2,<3
 # optional: without these, PDF / Word files are listed in files_skipped and Markdown still works
 pypdf>=5,<8
 python-docx>=1.1,<2
+# optional: hybrid (BM25 + vector) retrieval with a local ONNX model; without it, search is BM25 only
+fastembed>=0.7,<1

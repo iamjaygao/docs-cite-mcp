@@ -38,7 +38,6 @@ The Markdown path is stdlib only, so it runs anywhere without an install step.
 from __future__ import annotations
 
 import functools
-import heapq
 import json
 import math
 import os
@@ -47,8 +46,9 @@ import threading
 import time
 import unicodedata
 from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 # Bump whenever chunking, tokenizing or the cache layout changes: caches written
 # under another version are discarded instead of silently reused.
@@ -148,6 +148,24 @@ def read_markdown(path: Path) -> str:
 class DocView:
     kind: str                              # "markdown" | "pdf" | "docx"
     pages: tuple[tuple[str, ...], ...]     # PDF: one entry per page; others: exactly one
+
+
+def available_parsers() -> list[str]:
+    """The suffixes this environment can actually read; part of the cache key."""
+    import importlib.util
+
+    def importable(name: str) -> bool:
+        try:
+            return importlib.util.find_spec(name) is not None
+        except (ImportError, ValueError):     # e.g. a module masked as None in sys.modules
+            return False
+
+    out = [".md"]
+    if importable("pypdf"):
+        out.append(".pdf")
+    if importable("docx"):
+        out.append(".docx")
+    return out
 
 
 def load_view(path: Path) -> DocView:
@@ -409,6 +427,7 @@ class FileRecord:
     term_freqs: tuple[dict[str, int], ...] = ()   # parallel to chunks
     links: tuple[str, ...] = ()                   # outgoing [[wikilink]] targets
     error: str | None = None                      # set when the file could not be read
+    vectors: Any = None                           # (len(chunks), dim) array, or None if lexical-only
 
     @classmethod
     def parse(cls, rel: str, path: Path, stamp: tuple[int, int]) -> "FileRecord":
@@ -430,26 +449,37 @@ class FileRecord:
         )
 
     def to_json(self) -> dict:
-        return {
+        out = {
             "stamp": list(self.stamp),
             "chunks": [{**asdict(c), "tf": tf} for c, tf in zip(self.chunks, self.term_freqs)],
             "links": list(self.links),
             "error": self.error,
         }
+        if self.vectors is not None:
+            from dense import pack
+            out["vectors"] = pack(self.vectors)
+        return out
 
     @classmethod
-    def from_json(cls, raw: dict) -> "FileRecord":
+    def from_json(cls, raw: dict, dim: int | None = None) -> "FileRecord":
         chunks, tfs = [], []
         for c in raw["chunks"]:
             c = dict(c)
             tfs.append(c.pop("tf"))
             chunks.append(Chunk(**c))
+        vectors = None
+        if "vectors" in raw and dim:
+            from dense import unpack
+            vectors = unpack(raw["vectors"], dim)
+            if len(vectors) != len(chunks):
+                raise ValueError("cached vectors do not match cached chunks")
         return cls(
             stamp=tuple(raw["stamp"]),
             chunks=tuple(chunks),
             term_freqs=tuple(tfs),
             links=tuple(raw["links"]),
             error=raw.get("error"),
+            vectors=vectors,
         )
 
 
@@ -461,14 +491,22 @@ class _Snapshot:
     lens: tuple[int, ...] = ()
     avg_len: float = 0.0
     postings: dict[str, tuple[tuple[int, int], ...]] = field(default_factory=dict)
+    matrix: Any = None            # (len(chunks), dim) unit vectors, row i = chunk i; None if lexical
 
     @classmethod
-    def of(cls, files: dict[str, FileRecord]) -> "_Snapshot":
+    def of(cls, files: dict[str, FileRecord], dense: bool = False) -> "_Snapshot":
         chunks: list[Chunk] = []
         tfs: list[dict[str, int]] = []
+        blocks = []
         for record in files.values():
             chunks.extend(record.chunks)
             tfs.extend(record.term_freqs)
+            if dense and record.chunks:
+                blocks.append(record.vectors)
+        matrix = None
+        if dense:
+            import numpy as np
+            matrix = np.vstack(blocks) if blocks else np.zeros((0, 1), dtype=np.float32)
         postings: dict[str, list[tuple[int, int]]] = defaultdict(list)
         for i, tf in enumerate(tfs):
             for term, freq in tf.items():
@@ -480,6 +518,7 @@ class _Snapshot:
             lens=lens,
             avg_len=(sum(lens) / len(lens)) if lens else 0.0,
             postings={t: tuple(p) for t, p in postings.items()},
+            matrix=matrix,
         )
 
     def stamps(self) -> dict[str, tuple[int, int]]:
@@ -497,19 +536,28 @@ def _link_matches(target: str, note: str) -> bool:
     return t == n or t.endswith("/" + n) or n.endswith("/" + t)
 
 
+MODES = ("lexical", "dense", "hybrid")
+RRF_K = 60            # reciprocal rank fusion constant; the standard default, not tuned
+FUSION_DEPTH = 50     # candidates taken from each ranking before fusion
+
+
 class DocsIndex:
-    """BM25 over chunk-level postings, cached to disk, rebuilt incrementally."""
+    """
+    BM25 over chunk-level postings, plus optional dense vectors fused with
+    reciprocal rank fusion. Cached to disk, rebuilt incrementally.
+    """
 
     K1 = 1.5
     B = 0.75
 
     def __init__(self, docs_root: str | Path, cache_path: str | Path | None = None,
-                 refresh_interval: float = REFRESH_INTERVAL):
+                 refresh_interval: float = REFRESH_INTERVAL, embedder=None):
         self.root = Path(docs_root).expanduser().resolve()
         if not self.root.is_dir():
             raise ValueError(f"docs root is not a directory: {self.root}")
         self.cache_path = Path(cache_path) if cache_path else self.root / ".docs_cite_index.json"
         self.refresh_interval = refresh_interval
+        self.embedder = embedder                   # dense.Embedder, or None for BM25 only
         self.cache_error: str | None = None
         self._snap = _Snapshot()
         self._build_lock = threading.Lock()
@@ -519,21 +567,46 @@ class DocsIndex:
     def chunks(self) -> list[Chunk]:
         return list(self._snap.chunks)
 
+    @property
+    def default_mode(self) -> str:
+        return "hybrid" if self.embedder is not None else "lexical"
+
     # ---------- build ----------
 
-    @staticmethod
-    def _cache_key() -> list:
-        # chunk settings are part of the key: eval_search changes MAX_CHUNK_LINES at runtime
-        return [CACHE_VERSION, MAX_CHUNK_LINES, MIN_CHUNK_CHARS]
+    def _cache_key(self) -> list:
+        # chunk settings are part of the key: eval_search changes MAX_CHUNK_LINES at runtime;
+        # the embedding model is too: vectors from another model are not comparable;
+        # and so are the installed parsers: a cache built with pypdf must not serve PDF
+        # citations in an environment where read_span cannot open the PDF, and a cache
+        # built without it must not keep skipping PDFs once pypdf is installed
+        model = [self.embedder.name, self.embedder.dim] if self.embedder else None
+        return [CACHE_VERSION, MAX_CHUNK_LINES, MIN_CHUNK_CHARS, model, available_parsers()]
 
     def _load_cache(self) -> dict[str, FileRecord]:
         try:
             raw = json.loads(self.cache_path.read_text(encoding="utf-8"))
             if raw.get("key") != self._cache_key():
                 return {}
-            return {rel: FileRecord.from_json(rec) for rel, rec in raw["files"].items()}
+            dim = self.embedder.dim if self.embedder else None
+            return {rel: FileRecord.from_json(rec, dim) for rel, rec in raw["files"].items()}
         except (OSError, ValueError, KeyError, TypeError):
             return {}
+
+    def _embed_missing(self, files: dict[str, FileRecord]) -> int:
+        """Embed, in one batch, every chunk of every record that has no vectors yet."""
+        if self.embedder is None:
+            return 0
+        pending = [rel for rel, rec in files.items() if rec.chunks and rec.vectors is None]
+        texts = [_index_text(c) for rel in pending for c in files[rel].chunks]
+        if not texts:
+            return 0
+        vectors = self.embedder.embed(texts, "passage")
+        row = 0
+        for rel in pending:
+            n = len(files[rel].chunks)
+            files[rel] = replace(files[rel], vectors=vectors[row : row + n])
+            row += n
+        return len(texts)
 
     def _save(self, files: dict[str, FileRecord]) -> bool:
         """Best effort: a corpus we cannot write to is still a corpus we can search."""
@@ -567,8 +640,10 @@ class DocsIndex:
                     files[rel] = FileRecord.parse(rel, path, stamp)
                     reparsed += 1
 
+            embedded = self._embed_missing(files)
             changed = force or reparsed > 0 or files.keys() != previous.keys()
-            self._snap = _Snapshot.of(files)       # the single atomic swap
+            # the single atomic swap: BM25 statistics and vectors change together
+            self._snap = _Snapshot.of(files, dense=self.embedder is not None)
             self._last_sweep = time.monotonic()
             cache_written = self._save(files) if (changed or not self.cache_path.exists()) else False
 
@@ -578,6 +653,8 @@ class DocsIndex:
                 "chunks": len(self._snap.chunks),
                 "files_reparsed": reparsed,
                 "files_reused": reused,
+                "chunks_embedded": embedded,
+                "embedding_model": self.embedder.name if self.embedder else None,
                 "files_skipped": skipped,
                 "cache_written": cache_written,
                 "cache_error": self.cache_error,
@@ -602,11 +679,9 @@ class DocsIndex:
 
     # ---------- query ----------
 
-    def _rank(self, snap: _Snapshot, query: str, k: int,
-              max_per_doc: int | None = None) -> list[tuple[int, float]]:
+    def _lexical(self, snap: _Snapshot, query: str) -> tuple[list[int], dict[int, float]]:
+        """BM25: chunks with a positive score, best first; ties keep corpus order."""
         terms = {t for t in tokenize(query) if t in snap.postings}
-        if not terms:
-            return []
         n = len(snap.chunks)
         avg = snap.avg_len or 1
         scores: dict[int, float] = defaultdict(float)
@@ -616,37 +691,85 @@ class DocsIndex:
             for i, f in plist:
                 denom = f + self.K1 * (1 - self.B + self.B * snap.lens[i] / avg)
                 scores[i] += idf * (f * (self.K1 + 1)) / denom
-        candidates = sorted(i for i, s in scores.items() if s > 0)  # corpus order breaks ties
-        if not max_per_doc:
-            # nlargest is documented equal to sorted(...)[:k], so ties stay stable
-            return [(i, scores[i]) for i in heapq.nlargest(k, candidates, key=scores.__getitem__)]
+        # sorting is stable, so reverse=True still breaks ties by corpus order
+        order = sorted(sorted(i for i, s in scores.items() if s > 0),
+                       key=scores.__getitem__, reverse=True)
+        return order, scores
+
+    @staticmethod
+    def _dense(snap: _Snapshot, query_vec) -> tuple[list[int], dict[int, float]]:
+        """Cosine similarity against every chunk: exact, and milliseconds at this scale."""
+        import numpy as np
+        if snap.matrix is None or not len(snap.chunks):
+            return [], {}
+        sims = snap.matrix @ query_vec
+        order = np.argsort(-sims, kind="stable").tolist()
+        return order, {i: float(sims[i]) for i in order}
+
+    def _rank(self, snap: _Snapshot, query: str, k: int, max_per_doc: int | None,
+              mode: str, query_vec=None) -> list[tuple[int, float, dict]]:
+        """
+        Order candidates by `mode`, then fill k slots respecting max_per_doc.
+        The cap is applied after fusion: capping each list first would let one
+        document back in twice through the two lists.
+        """
+        lexical, lex_scores = self._lexical(snap, query) if mode != "dense" else ([], {})
+        dense, dense_scores = self._dense(snap, query_vec) if mode != "lexical" else ([], {})
+        lex_rank = {i: r for r, i in enumerate(lexical, start=1)}
+        dense_rank = {i: r for r, i in enumerate(dense, start=1)}
+
+        if mode == "lexical":
+            order, scores = lexical, lex_scores
+        elif mode == "dense":
+            order, scores = dense, dense_scores
+        else:
+            # Reciprocal rank fusion: uses ranks, not raw scores, so BM25 and
+            # cosine never have to be put on one scale.
+            scores = defaultdict(float)
+            for ranking in (lexical[:FUSION_DEPTH], dense[:FUSION_DEPTH]):
+                for r, i in enumerate(ranking, start=1):
+                    scores[i] += 1.0 / (RRF_K + r)
+            order = sorted(sorted(scores), key=scores.__getitem__, reverse=True)
+
         # Result crowding: one long document can match a little in many chunks and
         # fill every slot. Cap chunks per document so other documents get a slot.
-        ranked: list[tuple[int, float]] = []
+        ranked: list[tuple[int, float, dict]] = []
         per_doc: Counter = Counter()
-        for i in sorted(candidates, key=scores.__getitem__, reverse=True):
+        for i in order:
             path = snap.chunks[i].path
-            if per_doc[path] < max_per_doc:
-                per_doc[path] += 1
-                ranked.append((i, scores[i]))
-                if len(ranked) == k:
-                    break
+            if max_per_doc and per_doc[path] >= max_per_doc:
+                continue
+            per_doc[path] += 1
+            ranked.append((i, scores[i], {"lexical_rank": lex_rank.get(i),
+                                          "dense_rank": dense_rank.get(i)}))
+            if len(ranked) == k:
+                break
         return ranked
 
-    def search(self, query: str, k: int = 5, max_per_doc: int | None = None) -> list[dict]:
+    def search(self, query: str, k: int = 5, max_per_doc: int | None = None,
+               mode: str | None = None) -> list[dict]:
         """
         Top-k chunks for `query`. max_per_doc caps how many chunks one document
-        may contribute; None leaves the ranking uncapped.
+        may contribute; None leaves the ranking uncapped. mode is "lexical",
+        "dense" or "hybrid"; None means default_mode.
         """
+        mode = mode or self.default_mode
+        if mode not in MODES:
+            raise ValueError(f"mode must be one of {MODES}")
+        if mode != "lexical" and self.embedder is None:
+            raise MissingDependency(
+                f"mode={mode!r} needs an embedding model: pip install fastembed")
+        query_vec = self.embedder.embed([query], "query")[0] if mode != "lexical" else None
+
         self.refresh()
         snap = self._snap                          # hold one snapshot for the whole query
-        ranked = self._rank(snap, query, k, max_per_doc)
+        ranked = self._rank(snap, query, k, max_per_doc, mode, query_vec)
         # exact check on the files about to be cited, whatever the sweep interval
-        cited = {snap.chunks[i].path for i, _ in ranked}
+        cited = {snap.chunks[i].path for i, _, _ in ranked}
         if any(_stamp(self.root / rel) != snap.files[rel].stamp for rel in cited):
             self.build()
             snap = self._snap
-            ranked = self._rank(snap, query, k, max_per_doc)
+            ranked = self._rank(snap, query, k, max_per_doc, mode, query_vec)
         return [
             {
                 "chunk_id": c.chunk_id,
@@ -657,9 +780,10 @@ class DocsIndex:
                 "line_end": c.line_end,
                 "cite": c.cite,
                 "score": round(score, 4),
+                **ranks,
                 "text": c.text,
             }
-            for c, score in ((snap.chunks[i], s) for i, s in ranked)
+            for c, score, ranks in ((snap.chunks[i], s, r) for i, s, r in ranked)
         ]
 
     def resolve(self, rel_path: str) -> Path:

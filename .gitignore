@@ -21,3 +21,6 @@ __pycache__/
 venv/
 .pytest_cache/
 .DS_Store
+
+# embedding models downloaded in CI (DOCS_CITE_MODEL_DIR)
+.models/

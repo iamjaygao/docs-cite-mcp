@@ -41,6 +41,7 @@ async def main(query: str, docs: Path, k: int) -> int:
         if not found.get("ok"):
             print(f"search failed: {found.get('error')} -- {found.get('detail')}")
             return 1
+        print(f"retrieval mode: {found['mode']}\n")
         if not found["results"]:
             print(f"no passages matched {query!r}")
             return 0

@@ -29,6 +29,12 @@ from pydantic import TypeAdapter       # noqa: E402
 
 import server                          # noqa: E402
 
+try:
+    import fastembed  # noqa: F401
+    HAVE_MODEL = os.environ.get("DOCS_CITE_EMBED_MODEL", "").lower() != "none"
+except ImportError:
+    HAVE_MODEL = False
+
 failures: list[str] = []
 
 
@@ -115,6 +121,26 @@ async def main() -> int:
         docx_hit = (found.get("results") or [{}])[0]
         check("a Word hit is cited by block", "deployment-runbook.docx ¶" in docx_hit.get("cite", ""),
               f"-> {docx_hit.get('cite')}")
+
+        print("\nretrieval modes")
+        mode_schema = tools["search_notes"].input_schema["properties"].get("mode", {})
+        enum = {v for opt in mode_schema.get("anyOf", [mode_schema]) for v in opt.get("enum", [])}
+        check("mode is published as an enum", enum == {"hybrid", "lexical", "dense"}, f"-> {mode_schema}")
+        expected = "hybrid" if HAVE_MODEL else "lexical"
+        _, out = await call(client, "search_notes", {"query": "BM25 baseline NDCG", "k": 3})
+        check(f"default search reports mode={expected}", out.get("mode") == expected, f"-> {out.get('mode')}")
+        _, out = await call(client, "search_notes", {"query": "BM25 baseline NDCG", "k": 3, "mode": "lexical"})
+        check("mode=lexical is honoured and carries no dense rank",
+              out.get("mode") == "lexical"
+              and all(h["dense_rank"] is None for h in out.get("results", [])), f"-> {out.get('mode')}")
+        if HAVE_MODEL:
+            _, out = await call(client, "search_notes", {"query": "how far did median latency fall",
+                                                         "k": 3, "mode": "dense"})
+            check("mode=dense finds the PDF by meaning",
+                  out.get("results") and out["results"][0]["path"] == "reports/latency-review.pdf",
+                  f"-> {[h['cite'] for h in out.get('results', [])]}")
+        result, _ = await call(client, "search_notes", {"query": "x", "mode": "semantic"})
+        check("an unknown mode is rejected by the schema", result.is_error)
 
         _, links = await call(client, "list_backlinks", {"note": "evaluation-protocol.md"})
         check("backlinks resolve through the client",

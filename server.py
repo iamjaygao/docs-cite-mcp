@@ -23,7 +23,8 @@ Requires the MCP Python SDK v2 (FastMCP was renamed to MCPServer in 2.0).
 
 Run:
     export DOCS_ROOT=/path/to/docs
-    pip install -r requirements.txt     # mcp, plus pypdf and python-docx
+    pip install -r requirements.txt     # mcp, plus pypdf, python-docx, fastembed
+    python server.py --prepare          # optional: download the model, build the index
     python server.py
 
 Register with Claude Code:
@@ -33,8 +34,9 @@ Register with Claude Code:
 from __future__ import annotations
 
 import os
+import sys
 import threading
-from typing import Annotated
+from typing import Annotated, Literal
 
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
@@ -71,13 +73,14 @@ ERROR_CODES = {
     "page_required": "read_span on a PDF needs a page",
     "page_out_of_range": "the PDF has no such page, or a page was given for a non-PDF file",
     "unsupported_format": "not a Markdown, PDF or Word (.docx) file",
-    "missing_dependency": "pypdf or python-docx is not installed for this format",
+    "missing_dependency": "the optional library is not installed: pypdf, python-docx, or "
+                          "fastembed for mode=dense",
     "no_text_layer": "PDF has no extractable text (a scan); OCR is not supported",
     "unreadable": "file cannot be read: bad UTF-8, corrupt, encrypted, or permissions",
     "internal_error": "unexpected failure; detail carries the exception text",
 }
 
-mcp = MCPServer("docs-cite", version="0.3.0")
+mcp = MCPServer("docs-cite", version="0.4.0")
 
 # SDK v2 runs synchronous handlers on worker threads, so tools execute
 # concurrently. The index makes that safe itself (builds are serialised, and a
@@ -91,7 +94,10 @@ def get_index() -> DocsIndex:
     global _index
     with _index_lock:
         if _index is None:
-            index = DocsIndex(DOCS_ROOT)
+            # hybrid retrieval when fastembed is installed; DOCS_CITE_EMBED_MODEL=none
+            # or a missing fastembed falls back to BM25, and every result says which
+            from dense import default_embedder
+            index = DocsIndex(DOCS_ROOT, embedder=default_embedder())
             index.build()
             _index = index
         return _index
@@ -146,13 +152,16 @@ class SearchHit(TypedDict):
     line_start: int             # within `page` for a PDF; a block number for Word
     line_end: int
     cite: str                   # "a.md:3-8", "b.pdf p.2:1-4", "c.docx ¶3-5"
-    score: float
+    score: float                # BM25 (lexical), cosine (dense), or RRF (hybrid)
+    lexical_rank: int | None    # position in the BM25 ranking, if it ranked at all
+    dense_rank: int | None      # position in the vector ranking; None when lexical-only
     text: str
     truncated: bool
 
 
 class SearchResult(_Status):
     query: NotRequired[str]
+    mode: NotRequired[str]      # the retrieval mode actually used
     returned: NotRequired[int]
     results: NotRequired[list[SearchHit]]
     note: NotRequired[str]
@@ -178,6 +187,8 @@ class ReindexResult(_Status):
     chunks: NotRequired[int]
     files_reparsed: NotRequired[int]
     files_reused: NotRequired[int]
+    chunks_embedded: NotRequired[int]           # vectors computed in this build (0 = all cached)
+    embedding_model: NotRequired[str | None]    # None when the index is lexical-only
     files_skipped: NotRequired[list[str]]       # unreadable, scanned, or missing a parser
     cache_written: NotRequired[bool]
     cache_error: NotRequired[str | None]        # set when the cache could not be saved
@@ -197,6 +208,11 @@ def search_notes(
         description="Most passages any one document may contribute. The default keeps a long "
                     "document from filling every slot; raise it to see more of one document.",
     )] = DEFAULT_MAX_PER_DOC,
+    mode: Annotated[Literal["hybrid", "lexical", "dense"] | None, Field(
+        description="hybrid (default when an embedding model is installed) fuses keyword and "
+                    "semantic rankings; lexical is keyword-only (exact names, numbers, codes); "
+                    "dense is semantic-only. Omit for the server's default.",
+    )] = None,
 ) -> SearchResult:
     """
     Search Markdown, PDF and Word docs; return passages with their exact source location.
@@ -205,14 +221,16 @@ def search_notes(
     a ready-made `cite` string. Cite those rather than paraphrasing from memory;
     call read_span with the same path, lines and page to verify a passage before
     relying on it. Snippets longer than 1200 characters come back with
-    truncated=true.
+    truncated=true. `mode` in the result says which retrieval was used.
     """
     query = query.strip()
     if not query:
         return _error("empty_query", "query must contain non-whitespace text")
     k = max(1, min(int(k), MAX_RESULTS))   # schema enforces this; kept for direct calls
     try:
-        hits = get_index().search(query, k=k, max_per_doc=max_per_doc)
+        index = get_index()
+        used = mode or index.default_mode
+        hits = index.search(query, k=k, max_per_doc=max_per_doc, mode=used)
     except Exception as exc:  # structured failure, not a stack trace into the agent
         return _from_exception(exc)
 
@@ -223,6 +241,7 @@ def search_notes(
     return {
         "ok": True,
         "query": query,
+        "mode": used,
         "returned": len(results),
         "results": results,
         "note": "cite each hit's `cite`; call read_span (with page for PDFs) to verify",
@@ -296,5 +315,20 @@ def reindex(
         return _from_exception(exc)
 
 
+def prepare() -> int:
+    """
+    Download the embedding model and build the index ahead of time, so the
+    agent's first search is not the one that waits for it.
+    """
+    import json
+
+    from dense import default_embedder
+    stats = DocsIndex(DOCS_ROOT, embedder=default_embedder()).build()   # one build, its own stats
+    print(json.dumps(stats, indent=2), file=sys.stderr)
+    return 1 if stats["notes_indexed"] == 0 else 0
+
+
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--prepare"]:
+        raise SystemExit(prepare())
     mcp.run()
