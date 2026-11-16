@@ -3,44 +3,117 @@ Line-accurate chunking + BM25 retrieval over a markdown documentation tree.
 
 Design rule: every chunk carries the exact 1-based line span it came from, and
 that span must round-trip against the source file. If it doesn't, a citation is
-decoration rather than a reference. tests/test_index.py enforces this.
+decoration rather than a reference. test_index.py enforces this.
+
+Keeping that true while the corpus changes underneath a running server takes
+three more rules:
+
+  * Fresh. A search re-stats the files it is about to cite and rebuilds if any
+    changed, so a span never points into an older version of the file. New and
+    deleted files are picked up by a cheap stat sweep, at most every
+    REFRESH_INTERVAL seconds.
+  * Atomic. Each build produces an immutable snapshot and swaps it in with one
+    assignment. A search holds a single snapshot for its whole run, so a
+    concurrent reindex can never hand it chunks and statistics that disagree.
+  * Versioned. The on-disk cache records the chunker version and settings; a
+    cache written by different code is discarded, not reused.
 
 Stdlib only, so it runs anywhere without an install step.
 """
 
 from __future__ import annotations
 
+import heapq
 import json
 import math
 import os
 import re
+import threading
+import time
 import unicodedata
-from collections import Counter
-from dataclasses import dataclass, asdict
-from pathlib import Path
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass, field
+from pathlib import Path, PurePosixPath
 
+# Bump whenever chunking, tokenizing or the cache layout changes: caches written
+# under another version are discarded instead of silently reused.
+CACHE_VERSION = 3
 SKIP_DIRS = {".obsidian", ".trash", ".git", "node_modules", ".DS_Store"}
-MAX_CHUNK_LINES = 40          # long sections get split further
+MAX_CHUNK_LINES = 40          # long sections get split further, at a paragraph break
 MIN_CHUNK_CHARS = 20          # drop near-empty fragments
+REFRESH_INTERVAL = 2.0        # seconds between full stat sweeps for added/removed files
+
+# Chunks one document may contribute to a result list. Without a cap, a long
+# document matching a little in many chunks fills every slot (result crowding).
+# 2 rather than 1: the gold set is document-level, so it cannot see the cost of
+# hiding a document's second-best passage, which flatters a cap of 1.
+DEFAULT_MAX_PER_DOC = 2
 
 _WORD = re.compile(r"[a-z0-9]+")
+_CJK_RUN = re.compile(r"[぀-ヿ一-鿿가-힯]+")  # kana, CJK unified, hangul
 _WIKILINK = re.compile(r"\[\[([^\]|#]+)")
+_HEADING = re.compile(r"^ {0,3}(#{1,6})\s+(.*\S)\s*$")
+_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 
 
-def _is_cjk(ch: str) -> bool:
-    return any(
-        start <= ord(ch) <= end
-        for start, end in (
-            (0x4E00, 0x9FFF),    # CJK unified
-            (0x3040, 0x30FF),    # kana
-            (0xAC00, 0xD7AF),    # hangul
+class PathOutsideRoot(ValueError):
+    """A requested path resolves outside the docs root."""
+
+
+class InvalidSpan(ValueError):
+    """A requested line range is empty or inverted."""
+
+
+# ---------- corpus membership: the single definition every tool shares ----------
+
+def iter_markdown_files(root: Path) -> list[Path]:
+    """
+    Every .md file that belongs to the corpus, in a stable order.
+
+    Skips dot-directories and SKIP_DIRS, does not descend into directory
+    symlinks, and drops file symlinks that resolve outside the root -- those
+    could be searched but never read back, so their citations could not be
+    verified. make_gold.py lists the corpus through this same function.
+    """
+    root = root.resolve()
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(
+            d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")
         )
-    )
+        for name in sorted(filenames):
+            if not name.endswith(".md"):
+                continue
+            path = Path(dirpath) / name
+            if path.is_symlink() and not path.resolve().is_relative_to(root):
+                continue
+            out.append(path)
+    return out
 
+
+def read_markdown(path: Path) -> str:
+    """
+    Read a note the same way for indexing and for read_span.
+
+    utf-8-sig drops a leading byte-order mark, which would otherwise hide a
+    first-line heading. Universal newlines turn CRLF into LF on both paths.
+    """
+    return path.read_text(encoding="utf-8-sig")
+
+
+def _stamp(path: Path) -> tuple[int, int] | None:
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
+
+
+# ---------- tokenizing and chunking ----------
 
 def tokenize(text: str) -> list[str]:
     """
-    Latin text -> word tokens. CJK runs -> character bigrams plus unigrams.
+    Latin text -> word tokens. CJK runs -> character unigrams plus bigrams.
 
     Whitespace tokenization silently fails on Chinese and Japanese; bigrams are
     the cheap fix that does not need a segmenter. (Same failure mode I hit on
@@ -48,29 +121,14 @@ def tokenize(text: str) -> list[str]:
     """
     text = unicodedata.normalize("NFKC", text).lower()
     tokens: list[str] = []
-    cjk_run: list[str] = []
-
-    def flush_cjk() -> None:
-        if not cjk_run:
-            return
-        tokens.extend(cjk_run)
-        tokens.extend(
-            cjk_run[i] + cjk_run[i + 1] for i in range(len(cjk_run) - 1)
-        )
-        cjk_run.clear()
-
-    for match in re.finditer(r".", text, re.DOTALL):
-        ch = match.group(0)
-        if _is_cjk(ch):
-            cjk_run.append(ch)
-        else:
-            flush_cjk()
-    flush_cjk()
+    for run in _CJK_RUN.findall(text):
+        tokens.extend(run)
+        tokens.extend(run[i : i + 2] for i in range(len(run) - 1))
     tokens.extend(_WORD.findall(text))
     return tokens
 
 
-@dataclass
+@dataclass(frozen=True)
 class Chunk:
     chunk_id: str
     path: str          # relative to docs root
@@ -81,15 +139,32 @@ class Chunk:
 
 
 def chunk_markdown(rel_path: str, source: str) -> list[Chunk]:
-    """Split a note on headings, then on length, preserving line numbers."""
+    """
+    Split a note on headings, then on length, preserving line numbers.
+
+    Lines inside fenced code blocks are never headings: a `# comment` in a
+    shell or Python fence must not start a new section or enter the breadcrumb.
+    An unclosed fence runs to end of file, as in CommonMark.
+    """
     lines = source.split("\n")
     stack: list[tuple[int, str]] = []          # (level, title)
     sections: list[tuple[str, int, int]] = []  # (breadcrumb, start, end) 1-based
     cur_start = 1
     cur_crumb = ""
+    fence: str | None = None                   # opening fence marker while inside one
 
     for idx, line in enumerate(lines, start=1):
-        m = re.match(r"^(#{1,6})\s+(.*\S)\s*$", line)
+        f = _FENCE.match(line)
+        if fence is None and f:
+            fence = f.group(1)
+            continue
+        if fence is not None:
+            # closes on the same character, at least as long, nothing after it
+            if f and f.group(1)[0] == fence[0] and len(f.group(1)) >= len(fence) \
+                    and not line.strip()[len(f.group(1)):].strip():
+                fence = None
+            continue
+        m = _HEADING.match(line)
         if not m:
             continue
         if idx > cur_start:
@@ -104,8 +179,7 @@ def chunk_markdown(rel_path: str, source: str) -> list[Chunk]:
 
     chunks: list[Chunk] = []
     for crumb, start, end in sections:
-        for sub_start in range(start, end + 1, MAX_CHUNK_LINES):
-            sub_end = min(sub_start + MAX_CHUNK_LINES - 1, end)
+        for sub_start, sub_end in _split_section(lines, start, end):
             text = "\n".join(lines[sub_start - 1 : sub_end])
             if len(text.strip()) < MIN_CHUNK_CHARS:
                 continue
@@ -122,161 +196,312 @@ def chunk_markdown(rel_path: str, source: str) -> list[Chunk]:
     return chunks
 
 
+def _split_section(lines: list[str], start: int, end: int) -> list[tuple[int, int]]:
+    """
+    Cut [start, end] (1-based, inclusive) into spans of at most MAX_CHUNK_LINES.
+
+    Each cut moves back to the last blank line in the second half of the
+    window, so a paragraph or table is not split across two chunks; with no
+    blank line there, it falls back to the hard cut.
+    """
+    spans = []
+    s = start
+    while s <= end:
+        e = min(s + MAX_CHUNK_LINES - 1, end)
+        if e < end:
+            floor = s + MAX_CHUNK_LINES // 2
+            for b in range(e, floor - 1, -1):
+                if not lines[b - 1].strip():
+                    e = b
+                    break
+        spans.append((s, e))
+        s = e + 1
+    return spans
+
+
+def _index_text(chunk: Chunk) -> str:
+    """
+    The text BM25 scores: breadcrumb plus body. A chunk that opens with its own
+    heading counts that heading twice. That is deliberate: removing the
+    duplicate lowered MRR@5 from 0.753 to 0.715 on the gold set, because
+    heading terms are the strongest signal of what a section is about.
+    """
+    return f"{chunk.heading}\n{chunk.text}"
+
+
+# ---------- index state ----------
+
+@dataclass(frozen=True)
+class FileRecord:
+    """Everything derived from one file. Reused verbatim while its stamp holds."""
+    stamp: tuple[int, int]
+    chunks: tuple[Chunk, ...] = ()
+    term_freqs: tuple[dict[str, int], ...] = ()   # parallel to chunks
+    links: tuple[str, ...] = ()                   # outgoing [[wikilink]] targets
+    error: str | None = None                      # set when the file could not be read
+
+    @classmethod
+    def parse(cls, rel: str, path: Path, stamp: tuple[int, int]) -> "FileRecord":
+        try:
+            source = read_markdown(path)
+        except (UnicodeDecodeError, OSError) as exc:
+            # keep the stamp, so an unreadable file is not retried on every refresh
+            return cls(stamp=stamp, error=f"{type(exc).__name__}: {exc}")
+        chunks = tuple(chunk_markdown(rel, source))
+        return cls(
+            stamp=stamp,
+            chunks=chunks,
+            term_freqs=tuple(dict(Counter(tokenize(_index_text(c)))) for c in chunks),
+            links=tuple(sorted({t.strip() for t in _WIKILINK.findall(source) if t.strip()})),
+        )
+
+    def to_json(self) -> dict:
+        return {
+            "stamp": list(self.stamp),
+            "chunks": [{**asdict(c), "tf": tf} for c, tf in zip(self.chunks, self.term_freqs)],
+            "links": list(self.links),
+            "error": self.error,
+        }
+
+    @classmethod
+    def from_json(cls, raw: dict) -> "FileRecord":
+        chunks, tfs = [], []
+        for c in raw["chunks"]:
+            c = dict(c)
+            tfs.append(c.pop("tf"))
+            chunks.append(Chunk(**c))
+        return cls(
+            stamp=tuple(raw["stamp"]),
+            chunks=tuple(chunks),
+            term_freqs=tuple(tfs),
+            links=tuple(raw["links"]),
+            error=raw.get("error"),
+        )
+
+
+@dataclass(frozen=True)
+class _Snapshot:
+    """One consistent view of the index. Never mutated after construction."""
+    files: dict[str, FileRecord] = field(default_factory=dict)
+    chunks: tuple[Chunk, ...] = ()
+    lens: tuple[int, ...] = ()
+    avg_len: float = 0.0
+    postings: dict[str, tuple[tuple[int, int], ...]] = field(default_factory=dict)
+
+    @classmethod
+    def of(cls, files: dict[str, FileRecord]) -> "_Snapshot":
+        chunks: list[Chunk] = []
+        tfs: list[dict[str, int]] = []
+        for record in files.values():
+            chunks.extend(record.chunks)
+            tfs.extend(record.term_freqs)
+        postings: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        for i, tf in enumerate(tfs):
+            for term, freq in tf.items():
+                postings[term].append((i, freq))
+        lens = tuple(sum(tf.values()) for tf in tfs)
+        return cls(
+            files=files,
+            chunks=tuple(chunks),
+            lens=lens,
+            avg_len=(sum(lens) / len(lens)) if lens else 0.0,
+            postings={t: tuple(p) for t, p in postings.items()},
+        )
+
+    def stamps(self) -> dict[str, tuple[int, int]]:
+        return {rel: rec.stamp for rel, rec in self.files.items()}
+
+
+def _link_matches(target: str, note: str) -> bool:
+    """[[target]] points at `note` if the names agree and any folders given agree."""
+    t = target.removesuffix(".md").strip("/")
+    n = note.removesuffix(".md").strip("/")
+    if PurePosixPath(t).name != PurePosixPath(n).name:
+        return False
+    if "/" not in t or "/" not in n:
+        return True
+    return t == n or t.endswith("/" + n) or n.endswith("/" + t)
+
+
 class DocsIndex:
     """BM25 over chunk-level postings, cached to disk, rebuilt incrementally."""
 
     K1 = 1.5
     B = 0.75
 
-    def __init__(self, docs_root: str | Path, cache_path: str | Path | None = None):
+    def __init__(self, docs_root: str | Path, cache_path: str | Path | None = None,
+                 refresh_interval: float = REFRESH_INTERVAL):
         self.root = Path(docs_root).expanduser().resolve()
         if not self.root.is_dir():
             raise ValueError(f"docs root is not a directory: {self.root}")
         self.cache_path = Path(cache_path) if cache_path else self.root / ".docs_cite_index.json"
-        self.chunks: list[Chunk] = []
-        self.links: dict[str, list[str]] = {}   # note stem -> outgoing wikilink targets
-        self._stamps: dict[str, list[float]] = {}
-        self._df: Counter = Counter()
-        self._tf: list[Counter] = []
-        self._lens: list[int] = []
-        self._avg_len: float = 0.0
+        self.refresh_interval = refresh_interval
+        self.cache_error: str | None = None
+        self._snap = _Snapshot()
+        self._build_lock = threading.Lock()
+        self._last_sweep = float("-inf")
+
+    @property
+    def chunks(self) -> list[Chunk]:
+        return list(self._snap.chunks)
 
     # ---------- build ----------
 
-    def _walk(self) -> list[Path]:
-        out = []
-        for dirpath, dirnames, filenames in os.walk(self.root):
-            # skip dot-directories wholesale: .git, .venv, .pytest_cache, .obsidian...
-            dirnames[:] = [
-                d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")
-            ]
-            out.extend(
-                Path(dirpath) / f for f in filenames if f.endswith(".md")
-            )
-        return sorted(out)
+    @staticmethod
+    def _cache_key() -> list:
+        # chunk settings are part of the key: eval_search changes MAX_CHUNK_LINES at runtime
+        return [CACHE_VERSION, MAX_CHUNK_LINES, MIN_CHUNK_CHARS]
+
+    def _load_cache(self) -> dict[str, FileRecord]:
+        try:
+            raw = json.loads(self.cache_path.read_text(encoding="utf-8"))
+            if raw.get("key") != self._cache_key():
+                return {}
+            return {rel: FileRecord.from_json(rec) for rel, rec in raw["files"].items()}
+        except (OSError, ValueError, KeyError, TypeError):
+            return {}
+
+    def _save(self, files: dict[str, FileRecord]) -> bool:
+        """Best effort: a corpus we cannot write to is still a corpus we can search."""
+        payload = {"key": self._cache_key(), "files": {r: f.to_json() for r, f in files.items()}}
+        tmp = self.cache_path.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            tmp.replace(self.cache_path)
+        except OSError as exc:
+            self.cache_error = f"{type(exc).__name__}: {exc}"
+            return False
+        self.cache_error = None
+        return True
 
     def build(self, force: bool = False) -> dict:
-        cached: dict = {}
-        if not force and self.cache_path.exists():
-            try:
-                cached = json.loads(self.cache_path.read_text(encoding="utf-8"))
-            except (json.JSONDecodeError, OSError):
-                cached = {}
+        """Rescan the tree, reparsing only files whose (mtime_ns, size) changed."""
+        with self._build_lock:
+            previous = {} if force else (self._snap.files or self._load_cache())
+            files: dict[str, FileRecord] = {}
+            reparsed = reused = 0
+            for path in iter_markdown_files(self.root):
+                stamp = _stamp(path)
+                if stamp is None:                 # vanished mid-walk
+                    continue
+                rel = path.relative_to(self.root).as_posix()
+                cached = previous.get(rel)
+                if cached is not None and cached.stamp == stamp:
+                    files[rel] = cached
+                    reused += 1
+                else:
+                    files[rel] = FileRecord.parse(rel, path, stamp)
+                    reparsed += 1
 
-        prev_stamps = cached.get("stamps", {})
-        prev_by_file: dict[str, list[dict]] = {}
-        for raw in cached.get("chunks", []):
-            prev_by_file.setdefault(raw["path"], []).append(raw)
+            changed = force or reparsed > 0 or files.keys() != previous.keys()
+            self._snap = _Snapshot.of(files)       # the single atomic swap
+            self._last_sweep = time.monotonic()
+            cache_written = self._save(files) if (changed or not self.cache_path.exists()) else False
 
-        chunks: list[Chunk] = []
-        stamps: dict[str, list[float]] = {}
-        links: dict[str, list[str]] = dict(cached.get("links", {}))
-        reused = rebuilt = 0
+            skipped = sorted(rel for rel, rec in files.items() if rec.error)
+            return {
+                "notes_indexed": len(files) - len(skipped),
+                "chunks": len(self._snap.chunks),
+                "files_reparsed": reparsed,
+                "files_reused": reused,
+                "files_skipped": skipped,
+                "cache_written": cache_written,
+                "cache_error": self.cache_error,
+            }
 
-        for path in self._walk():
-            rel = path.relative_to(self.root).as_posix()
-            st = path.stat()
-            stamp = [st.st_mtime, float(st.st_size)]
-            stamps[rel] = stamp
-            if prev_stamps.get(rel) == stamp and rel in prev_by_file:
-                chunks.extend(Chunk(**raw) for raw in prev_by_file[rel])
-                reused += 1
-                continue
-            try:
-                source = path.read_text(encoding="utf-8")
-            except (UnicodeDecodeError, OSError):
-                continue
-            chunks.extend(chunk_markdown(rel, source))
-            links[Path(rel).stem] = sorted(set(_WIKILINK.findall(source)))
-            rebuilt += 1
-
-        self.chunks = chunks
-        self.links = {k: v for k, v in links.items() if k in {Path(p).stem for p in stamps}}
-        self._stamps = stamps
-        self._fit()
-        self._save()
-        return {
-            "notes_indexed": len(stamps),
-            "chunks": len(chunks),
-            "files_reparsed": rebuilt,
-            "files_reused": reused,
+    def refresh(self) -> bool:
+        """
+        Rebuild if any file was added, removed or changed. The sweep is a stat
+        per file, no reads, and runs at most once per refresh_interval.
+        """
+        if time.monotonic() - self._last_sweep < self.refresh_interval:
+            return False
+        self._last_sweep = time.monotonic()
+        current = {
+            p.relative_to(self.root).as_posix(): _stamp(p)
+            for p in iter_markdown_files(self.root)
         }
-
-    def _fit(self) -> None:
-        self._tf = []
-        self._lens = []
-        self._df = Counter()
-        for chunk in self.chunks:
-            toks = tokenize(f"{chunk.heading}\n{chunk.text}")
-            tf = Counter(toks)
-            self._tf.append(tf)
-            self._lens.append(len(toks))
-            self._df.update(tf.keys())
-        self._avg_len = (sum(self._lens) / len(self._lens)) if self._lens else 0.0
-
-    def _save(self) -> None:
-        payload = {
-            "version": 1,
-            "stamps": self._stamps,
-            "links": self.links,
-            "chunks": [asdict(c) for c in self.chunks],
-        }
-        tmp = self.cache_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(payload), encoding="utf-8")
-        tmp.replace(self.cache_path)
+        if current == self._snap.stamps():
+            return False
+        self.build()
+        return True
 
     # ---------- query ----------
 
-    def search(self, query: str, k: int = 5) -> list[dict]:
-        if not self.chunks:
+    def _rank(self, snap: _Snapshot, query: str, k: int,
+              max_per_doc: int | None = None) -> list[tuple[int, float]]:
+        terms = {t for t in tokenize(query) if t in snap.postings}
+        if not terms:
             return []
-        q = [t for t in tokenize(query) if self._df.get(t)]
-        if not q:
-            return []
-        n = len(self.chunks)
-        scores = [0.0] * n
-        for term in set(q):
-            df = self._df[term]
-            idf = math.log(1 + (n - df + 0.5) / (df + 0.5))
-            for i, tf in enumerate(self._tf):
-                f = tf.get(term)
-                if not f:
-                    continue
-                denom = f + self.K1 * (
-                    1 - self.B + self.B * self._lens[i] / (self._avg_len or 1)
-                )
+        n = len(snap.chunks)
+        avg = snap.avg_len or 1
+        scores: dict[int, float] = defaultdict(float)
+        for term in terms:
+            plist = snap.postings[term]
+            idf = math.log(1 + (n - len(plist) + 0.5) / (len(plist) + 0.5))
+            for i, f in plist:
+                denom = f + self.K1 * (1 - self.B + self.B * snap.lens[i] / avg)
                 scores[i] += idf * (f * (self.K1 + 1)) / denom
-        ranked = sorted(range(n), key=lambda i: scores[i], reverse=True)[:k]
+        candidates = sorted(i for i, s in scores.items() if s > 0)  # corpus order breaks ties
+        if not max_per_doc:
+            # nlargest is documented equal to sorted(...)[:k], so ties stay stable
+            return [(i, scores[i]) for i in heapq.nlargest(k, candidates, key=scores.__getitem__)]
+        # Result crowding: one long document can match a little in many chunks and
+        # fill every slot. Cap chunks per document so other documents get a slot.
+        ranked: list[tuple[int, float]] = []
+        per_doc: Counter = Counter()
+        for i in sorted(candidates, key=scores.__getitem__, reverse=True):
+            path = snap.chunks[i].path
+            if per_doc[path] < max_per_doc:
+                per_doc[path] += 1
+                ranked.append((i, scores[i]))
+                if len(ranked) == k:
+                    break
+        return ranked
+
+    def search(self, query: str, k: int = 5, max_per_doc: int | None = None) -> list[dict]:
+        """
+        Top-k chunks for `query`. max_per_doc caps how many chunks one document
+        may contribute; None leaves the ranking uncapped.
+        """
+        self.refresh()
+        snap = self._snap                          # hold one snapshot for the whole query
+        ranked = self._rank(snap, query, k, max_per_doc)
+        # exact check on the files about to be cited, whatever the sweep interval
+        cited = {snap.chunks[i].path for i, _ in ranked}
+        if any(_stamp(self.root / rel) != snap.files[rel].stamp for rel in cited):
+            self.build()
+            snap = self._snap
+            ranked = self._rank(snap, query, k, max_per_doc)
         return [
             {
-                "chunk_id": self.chunks[i].chunk_id,
-                "path": self.chunks[i].path,
-                "heading": self.chunks[i].heading,
-                "line_start": self.chunks[i].line_start,
-                "line_end": self.chunks[i].line_end,
-                "score": round(scores[i], 4),
-                "text": self.chunks[i].text,
+                "chunk_id": c.chunk_id,
+                "path": c.path,
+                "heading": c.heading,
+                "line_start": c.line_start,
+                "line_end": c.line_end,
+                "score": round(score, 4),
+                "text": c.text,
             }
-            for i in ranked
-            if scores[i] > 0
+            for c, score in ((snap.chunks[i], s) for i, s in ranked)
         ]
 
     def resolve(self, rel_path: str) -> Path:
         """Resolve a root-relative path, refusing anything outside the docs root."""
         candidate = (self.root / rel_path).resolve()
         if not candidate.is_relative_to(self.root):
-            raise ValueError(f"path escapes the docs root: {rel_path}")
+            raise PathOutsideRoot(f"path escapes the docs root: {rel_path}")
         if not candidate.is_file():
             raise FileNotFoundError(rel_path)
         return candidate
 
     def read_span(self, rel_path: str, line_start: int, line_end: int) -> dict:
         path = self.resolve(rel_path)
-        lines = path.read_text(encoding="utf-8").split("\n")
+        lines = read_markdown(path).split("\n")
         start = max(1, int(line_start))
         end = min(len(lines), int(line_end))
         if end < start:
-            raise ValueError(f"empty span {line_start}-{line_end}")
+            raise InvalidSpan(f"empty span {line_start}-{line_end}")
         return {
             "path": rel_path,
             "line_start": start,
@@ -285,5 +510,10 @@ class DocsIndex:
             "text": "\n".join(lines[start - 1 : end]),
         }
 
-    def backlinks(self, note_stem: str) -> list[str]:
-        return sorted(src for src, targets in self.links.items() if note_stem in targets)
+    def backlinks(self, note: str) -> list[str]:
+        """Root-relative paths of the documents whose [[wikilinks]] point at `note`."""
+        self.refresh()
+        return sorted(
+            rel for rel, rec in self._snap.files.items()
+            if any(_link_matches(t, note) for t in rec.links)
+        )

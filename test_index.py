@@ -8,10 +8,15 @@ Run: python test_index.py
 
 from __future__ import annotations
 
+import json
+import os
 import shutil
 import tempfile
+import threading
 from pathlib import Path
+from unittest import mock
 
+import docs_index
 from docs_index import DocsIndex, chunk_markdown, tokenize
 
 FIXTURES = {
@@ -57,6 +62,188 @@ def build_corpus(root: Path) -> None:
         path.write_text(body, encoding="utf-8")
 
 
+def corpus(files: dict[str, str]) -> Path:
+    root = Path(tempfile.mkdtemp(prefix="docs_sys_"))
+    _scratch.append(root)
+    for rel, body in files.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+    return root
+
+
+_scratch: list[Path] = []
+
+
+def system_checks() -> None:
+    """Each check here reproduced a real defect before the fix that made it pass."""
+    try:
+        print("\nfreshness: a citation never points into an older version of the file")
+        root = corpus({"a.md": "# A\nalpha bravo charlie delta echo foxtrot\n"})
+        idx = DocsIndex(root, refresh_interval=3600)     # sweep disabled: test the hit check
+        idx.build()
+        (root / "a.md").write_text(
+            "# A\nnew intro line inserted here\nmore filler text\n"
+            "alpha bravo charlie delta echo foxtrot\n", encoding="utf-8")
+        hit = idx.search("foxtrot")[0]
+        span = idx.read_span(hit["path"], hit["line_start"], hit["line_end"])
+        check("edited file is re-read before it is cited", span["text"] == hit["text"],
+              f"-> cited {hit['line_start']}-{hit['line_end']}")
+
+        idx = DocsIndex(root, refresh_interval=0)
+        idx.build()
+        (root / "b.md").write_text("# B\nnovel golf hotel india term\n", encoding="utf-8")
+        check("new file is found without a manual reindex",
+              [h["path"] for h in idx.search("hotel india")] == ["b.md"])
+        (root / "b.md").unlink()
+        check("deleted file stops being returned", idx.search("hotel india") == [])
+
+        print("\ncache versioning")
+        root = corpus({"a.md": "# A\nsome text here for the chunk\n"})
+        DocsIndex(root).build()
+        cache = root / ".docs_cite_index.json"
+        raw = json.loads(cache.read_text())
+        raw["key"][0] = -1                                 # written by "other" code
+        for rec in raw["files"].values():
+            rec["chunks"][0]["heading"] = "STALE-FROM-OLD-CHUNKER"
+        cache.write_text(json.dumps(raw))
+        idx = DocsIndex(root)
+        stats = idx.build()
+        check("cache from another chunker version is discarded",
+              idx.chunks[0].heading == "A" and stats["files_reparsed"] == 1,
+              f"-> {idx.chunks[0].heading!r}")
+        legacy = {"version": 1, "stamps": {}, "links": {}, "chunks": []}
+        cache.write_text(json.dumps(legacy))
+        check("pre-versioning cache layout is discarded, not crashed on",
+              DocsIndex(root).build()["files_reparsed"] == 1)
+
+        print("\nconcurrency: search during reindex sees one consistent snapshot")
+        body = "\n".join(f"line {i} kilo lima mike november oscar" for i in range(200))
+        root = corpus({f"d{i}.md": f"# D{i}\n{body}\n" for i in range(40)})
+        idx = DocsIndex(root, refresh_interval=3600)
+        idx.build()
+        errors: list[str] = []
+        stop = threading.Event()
+
+        def searcher() -> None:
+            while not stop.is_set():
+                try:
+                    idx.search("kilo november", k=5)
+                except Exception as exc:  # noqa: BLE001 -- any failure is the finding
+                    errors.append(type(exc).__name__)
+
+        threads = [threading.Thread(target=searcher) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for _ in range(5):
+            idx.build(force=True)
+        stop.set()
+        for t in threads:
+            t.join()
+        check("no errors from searches racing 5 forced rebuilds", not errors,
+              f"-> {len(errors)} errors {set(errors)}")
+
+        print("\ncorpus boundaries")
+        outside = corpus({"secret.md": "# S\nzulu yankee xray whiskey\n"})
+        root = corpus({"a.md": "# A\nplain content line here\n"})
+        (root / "link.md").symlink_to(outside / "secret.md")
+        (root / "inner.md").symlink_to(root / "a.md")
+        idx = DocsIndex(root)
+        idx.build()
+        check("symlink escaping the root is not indexed", idx.search("zulu") == [])
+        check("symlink inside the root is still indexed",
+              any(c.path == "inner.md" for c in idx.chunks))
+
+        print("\nbacklinks are keyed by path, not by file name")
+        root = corpus({
+            "x/notes.md": "# x\nsee [[target]] here\n",
+            "y/notes.md": "# y\nnothing linked from here\n",
+            "z/other.md": "# z\nsee [[y/notes]] and [[target.md]]\n",
+            "target.md": "# t\nbody text\n",
+        })
+        idx = DocsIndex(root)
+        idx.build()
+        check("same-named notes in two folders keep their own links",
+              idx.backlinks("target") == ["x/notes.md", "z/other.md"],
+              f"-> {idx.backlinks('target')}")
+        check("a folder-qualified link resolves to that folder only",
+              idx.backlinks("y/notes.md") == ["z/other.md"]
+              and idx.backlinks("x/notes") == [],
+              f"-> y:{idx.backlinks('y/notes.md')} x:{idx.backlinks('x/notes')}")
+
+        print("\nencodings")
+        root = corpus({})
+        (root / "bom.md").write_text("﻿# Title\nbody text line here\n## Sub\nmore body text\n",
+                                     encoding="utf-8")
+        (root / "crlf.md").write_bytes(b"# Win\r\nwindows line endings here\r\n")
+        (root / "latin1.md").write_bytes("# Caf\xe9\nnot utf-8 at all here\n".encode("latin-1"))
+        idx = DocsIndex(root)
+        stats = idx.build()
+        heads = [c.heading for c in idx.chunks if c.path == "bom.md"]
+        check("byte-order mark does not hide the first heading",
+              heads == ["Title", "Title > Sub"], f"-> {heads}")
+        crlf = idx.search("windows endings")[0]
+        check("CRLF spans round-trip through read_span",
+              idx.read_span("crlf.md", crlf["line_start"], crlf["line_end"])["text"] == crlf["text"])
+        check("unreadable file is reported, not silently dropped",
+              stats["files_skipped"] == ["latin1.md"], f"-> {stats['files_skipped']}")
+
+        print("\na read-only corpus is still searchable")
+        root = corpus({"a.md": "# A\nquebec romeo sierra tango\n"})
+        os.chmod(root, 0o555)
+        try:
+            idx = DocsIndex(root)
+            stats = idx.build()
+            check("build succeeds without a writable cache",
+                  stats["notes_indexed"] == 1 and stats["cache_written"] is False
+                  and stats["cache_error"], f"-> {stats}")
+            check("search works on it", bool(idx.search("romeo")))
+        finally:
+            os.chmod(root, 0o755)
+
+        print("\nlong sections split at a paragraph break")
+        para = lambda tag, n: [f"{tag} sentence {i} of the paragraph" for i in range(n)]  # noqa: E731
+        lines = ["# Long"] + para("first", 30) + [""] + para("second", 30)
+        spans = [(c.line_start, c.line_end) for c in chunk_markdown("long.md", "\n".join(lines))]
+        check("cut lands on the blank line, not mid-paragraph",
+              spans == [(1, 32), (33, 62)], f"-> {spans}")
+        check("no chunk exceeds MAX_CHUNK_LINES",
+              all(e - s + 1 <= docs_index.MAX_CHUNK_LINES for s, e in spans))
+        dense = "\n".join(["# Dense"] + para("x", 90))
+        dense_spans = [(c.line_start, c.line_end) for c in chunk_markdown("dense.md", dense)]
+        check("without a blank line it falls back to the hard cut",
+              dense_spans == [(1, 40), (41, 80), (81, 91)], f"-> {dense_spans}")
+
+        print("\nresult crowding: chunks per document are capped")
+        long_doc = "\n\n".join(f"## Part {i}\npapa quebec detail {i}" for i in range(12))
+        root = corpus({"long.md": f"# Long\n{long_doc}\n",
+                       "short.md": "# Short\npapa quebec, the authoritative answer\n"})
+        idx = DocsIndex(root)
+        idx.build()
+        uncapped = [h["path"] for h in idx.search("papa quebec", k=5)]
+        capped = [h["path"] for h in idx.search("papa quebec", k=5, max_per_doc=2)]
+        check("uncapped, the long document can crowd the list",
+              uncapped.count("long.md") >= 4, f"-> {uncapped}")
+        check("capped at 2, the long document holds at most two slots",
+              capped.count("long.md") == 2 and "short.md" in capped, f"-> {capped}")
+
+        print("\nincremental rebuild does no work when nothing changed")
+        root = corpus({f"d{i}.md": f"# D{i}\n{body}\n" for i in range(40)})
+        DocsIndex(root).build()
+        cache = root / ".docs_cite_index.json"
+        before = cache.stat().st_mtime_ns
+        fresh = DocsIndex(root)                            # new process: starts from the cache
+        with mock.patch("docs_index.tokenize", side_effect=AssertionError("re-tokenized")):
+            stats = fresh.build()
+        check("no file is re-tokenized from a warm cache", stats["files_reparsed"] == 0)
+        check("an unchanged index does not rewrite its cache",
+              cache.stat().st_mtime_ns == before and stats["cache_written"] is False)
+    finally:
+        for path in _scratch:
+            os.chmod(path, 0o755)
+            shutil.rmtree(path, ignore_errors=True)
+
+
 def main() -> int:
     root = Path(tempfile.mkdtemp(prefix="docs_"))
     try:
@@ -97,7 +284,9 @@ def main() -> int:
             check("read_span matches the search snippet", span["text"] == top["text"])
 
         print("\nbacklinks")
-        check("esci links to two-tower", "esci" in index.backlinks("two-tower"))
+        check("esci links to two-tower",
+              index.backlinks("two-tower") == ["research/esci.md"],
+              f"-> {index.backlinks('two-tower')}")
 
         print("\npath guard")
         for bad in ("../../etc/passwd", "/etc/passwd"):
@@ -118,6 +307,36 @@ def main() -> int:
 
         print("\nempty file does not crash the chunker")
         check("empty source -> no chunks", chunk_markdown("empty.md", "") == [])
+
+        print("\ncode fences")
+        fenced = (
+            "# Setup\n"
+            "Install the package and configure the shell.\n"
+            "```bash\n"
+            "# install dependencies first\n"
+            "pip install mcp\n"
+            "```\n"
+            "~~~~python\n"
+            "# a comment, not a heading\n"
+            "~~~\n"                       # too short: does not close a ~~~~ fence
+            "## still inside the fence\n"
+            "~~~~\n"
+            "## Usage\n"
+            "Run the server with the docs root set.\n"
+        )
+        crumbs = [c.heading for c in chunk_markdown("fenced.md", fenced)]
+        check("# inside a fence is not a heading",
+              not any("install dependencies" in h or "a comment" in h for h in crumbs),
+              f"-> {crumbs}")
+        check("shorter closing marker does not end a fence",
+              not any("still inside" in h for h in crumbs), f"-> {crumbs}")
+        check("headings after the fence still split",
+              crumbs == ["Setup", "Setup > Usage"], f"-> {crumbs}")
+        unclosed = chunk_markdown("open.md", "# Top\nsome intro text here\n```\n# not a heading\n")
+        check("unclosed fence runs to end of file",
+              [c.heading for c in unclosed] == ["Top"], f"-> {[c.heading for c in unclosed]}")
+
+        system_checks()
 
         print()
         if failures:

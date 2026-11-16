@@ -24,6 +24,9 @@ Usage:
     python eval_search.py --docs ./sample-docs --gold gold.jsonl
     python eval_search.py --docs ./sample-docs --gold gold.jsonl --unit chunk
     python eval_search.py --docs ./sample-docs --gold gold.jsonl --compare chunk_lines=20,40
+
+    # CI gate: exit 1 if retrieval quality drops below a floor
+    python eval_search.py --docs ./sample-docs --gold gold.jsonl --min-recall 0.85 --min-ndcg 0.75
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ import argparse
 import json
 import math
 import random
+import sys
 from collections import Counter
 from pathlib import Path
 
@@ -106,13 +110,13 @@ def concentration(hits: list[dict], k: int) -> float:
 
 
 def run(index: DocsIndex, gold: list[dict], k: int, depth: int,
-        unit: str = "document") -> dict:
+        unit: str = "document", max_per_doc: int | None = None) -> dict:
     per_query = []
     for row in gold:
         relevant = set(row["relevant"])
         if not relevant:
             continue
-        hits = index.search(row["query"], k=depth)
+        hits = index.search(row["query"], k=depth, max_per_doc=max_per_doc)
         ranked = chunk_ranking(hits) if unit == "chunk" else dedup_paths(hits)
         per_query.append(
             {
@@ -168,12 +172,33 @@ def paired_bootstrap(
     }
 
 
+def check_floors(result: dict, args: argparse.Namespace) -> int:
+    """Compare a run against --min-* floors. Returns the process exit code."""
+    floors = {
+        f"recall@{args.k}": args.min_recall,
+        f"ndcg@{args.k}": args.min_ndcg,
+        f"mrr@{args.k}": args.min_mrr,
+    }
+    breached = [
+        f"{metric} {result[metric]:.4f} < floor {floor:.4f}"
+        for metric, floor in floors.items()
+        if floor is not None and result[metric] < floor
+    ]
+    for line in breached:
+        print(f"QUALITY GATE FAILED: {line}", file=sys.stderr)
+    if any(f is not None for f in floors.values()) and not breached:
+        print("quality gate passed", file=sys.stderr)
+    return 1 if breached else 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--docs", required=True)
     ap.add_argument("--gold", required=True)
     ap.add_argument("--k", type=int, default=5)
     ap.add_argument("--depth", type=int, default=20, help="chunks retrieved before dedup")
+    ap.add_argument("--max-per-doc", type=int, default=docs_index.DEFAULT_MAX_PER_DOC,
+                    help="cap chunks per document, as the server does by default; 0 = uncapped")
     ap.add_argument("--unit", choices=["document", "chunk"], default="document",
                     help="document: dedup chunks to their file (retrieval quality). "
                          "chunk: score the list the agent actually sees (result crowding).")
@@ -181,7 +206,15 @@ def main() -> int:
         "--compare",
         help="A/B one knob, e.g. chunk_lines=20,40 -- reindexes and paired-bootstraps",
     )
+    gate = ap.add_argument_group(
+        "quality gate", "exit 1 if a metric falls below its floor -- lets CI fail on a retrieval regression"
+    )
+    gate.add_argument("--min-recall", type=float, help="floor for recall@k")
+    gate.add_argument("--min-ndcg", type=float, help="floor for ndcg@k")
+    gate.add_argument("--min-mrr", type=float, help="floor for mrr@k")
     args = ap.parse_args()
+    if args.compare and any(f is not None for f in (args.min_recall, args.min_ndcg, args.min_mrr)):
+        ap.error("--min-* floors apply to a single run; they cannot be combined with --compare")
 
     gold = [
         json.loads(line)
@@ -195,10 +228,10 @@ def main() -> int:
     if not args.compare:
         index = DocsIndex(args.docs)
         index.build()
-        result = run(index, gold, args.k, args.depth, args.unit)
+        result = run(index, gold, args.k, args.depth, args.unit, args.max_per_doc)
         print(json.dumps({k: v for k, v in result.items() if k != "per_query"}, indent=2,
                          ensure_ascii=False))
-        return 0
+        return check_floors(result, args)
 
     knob, raw = args.compare.split("=", 1)
     if knob != "chunk_lines":
@@ -213,7 +246,7 @@ def main() -> int:
         cache_dir.mkdir(exist_ok=True)
         index = DocsIndex(args.docs, cache_path=cache_dir / f"eval_index_{value}.json")
         index.build(force=True)
-        runs[value] = run(index, gold, args.k, args.depth, args.unit)
+        runs[value] = run(index, gold, args.k, args.depth, args.unit, args.max_per_doc)
 
     for metric in (f"recall@{args.k}", f"ndcg@{args.k}"):
         key = "recall" if metric.startswith("recall") else "ndcg"

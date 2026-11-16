@@ -29,7 +29,7 @@ import json
 import re
 from pathlib import Path
 
-from docs_index import DocsIndex
+from docs_index import DocsIndex, iter_markdown_files, read_markdown
 
 REVEAL_DEPTH = 10
 
@@ -48,12 +48,12 @@ class Corpus:
         self.root = root
         self.paths: list[str] = []
         self.text: dict[str, str] = {}
-        for path in sorted(root.rglob("*.md")):
-            if any(part.startswith(".") for part in path.relative_to(root).parts):
-                continue
-            rel = path.relative_to(root).as_posix()
+        # the same membership rules and decoding as the index: a document the
+        # retriever can return must be one you can find here to label
+        for path in iter_markdown_files(root):
+            rel = path.relative_to(root.resolve()).as_posix()
             try:
-                self.text[rel] = path.read_text(encoding="utf-8")
+                self.text[rel] = read_markdown(path)
             except (UnicodeDecodeError, OSError):
                 continue
             self.paths.append(rel)
