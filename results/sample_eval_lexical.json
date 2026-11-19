@@ -1,0 +1,11 @@
+{
+  "unit": "document",
+  "queries": 10,
+  "recall@3": 0.9,
+  "ndcg@3": 0.8630929753571458,
+  "mrr@3": 0.85,
+  "top_doc_share": 0.4333333333333333,
+  "zero_hit_queries": [
+    "中文分词怎么处理"
+  ]
+}

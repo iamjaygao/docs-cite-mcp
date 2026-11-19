@@ -1,0 +1,113 @@
+{
+ "script": "bench/perf.py",
+ "created_utc": "2026-11-19T01:10:10+00:00",
+ "versions": {
+  "old": "d7629a24051b980fdd9a47393eb8601c094bc4a3",
+  "current": "8749f8ecfebd489624ad809d2b03b5527f59b16d",
+  "current_uncommitted_changes": false
+ },
+ "environment": {
+  "python": "3.11.15",
+  "platform": "macOS-26.5.2-arm64-arm-64bit",
+  "machine": "arm64",
+  "cpu_count": 16
+ },
+ "setup": {
+  "synthetic_corpus": {
+   "docs": 300,
+   "lines_per_section": 60,
+   "vocabulary": 20000,
+   "seed": 0,
+   "sections_per_doc": 2
+  },
+  "repeats": 5,
+  "search": "query 'w17 w4242 w999 w12345', k=10, mean of 50 calls per repeat",
+  "retrieval": "lexical (BM25) only; no embedding model"
+ },
+ "results": {
+  "old": {
+   "chunks": 1200,
+   "full_build_s_median": 0.9046422090032138,
+   "full_build_s_runs": [
+    0.8918335419984942,
+    0.9072112920002837,
+    0.9046422090032138,
+    0.9089924999971117,
+    0.8948654999985592
+   ],
+   "noop_rebuild_s_median": 0.8812600829987787,
+   "noop_rebuild_s_runs": [
+    0.8873926250016666,
+    0.8695987909995893,
+    0.8704593750007916,
+    0.8812600829987787,
+    0.8846929579995049
+   ],
+   "fresh_instance_from_cache_s_median": 0.8749104580019775,
+   "fresh_instance_from_cache_s_runs": [
+    0.8851534589994117,
+    0.8688786249986151,
+    0.8643944579998788,
+    0.8831955419991573,
+    0.8749104580019775
+   ],
+   "search_ms_mean_median": 0.2730866600177251,
+   "search_ms_mean_runs": [
+    0.27000334004696924,
+    0.2721283400023822,
+    0.2730866600177251,
+    0.27376831996662077,
+    0.27491916000144556
+   ],
+   "race": {
+    "threads": 4,
+    "forced_rebuilds": 3,
+    "errors": 9,
+    "error_types": [
+     "IndexError"
+    ]
+   }
+  },
+  "current": {
+   "chunks": 1200,
+   "full_build_s_median": 0.17723045800084947,
+   "full_build_s_runs": [
+    0.17787866599974222,
+    0.17435016699892003,
+    0.17723045800084947,
+    0.17679033400054323,
+    0.17883116700249957
+   ],
+   "noop_rebuild_s_median": 0.06438566699944204,
+   "noop_rebuild_s_runs": [
+    0.06063337500017951,
+    0.06377925000197138,
+    0.0648498330010625,
+    0.06438566699944204,
+    0.06461166699955356
+   ],
+   "fresh_instance_from_cache_s_median": 0.09108670899877325,
+   "fresh_instance_from_cache_s_runs": [
+    0.09108670899877325,
+    0.09146204100034083,
+    0.09067387499817414,
+    0.09000216699860175,
+    0.09185016600167728
+   ],
+   "search_ms_mean_median": 0.04705416002252605,
+   "search_ms_mean_runs": [
+    0.05047168000601232,
+    0.04705416002252605,
+    0.049504999988130294,
+    0.046921659959480166,
+    0.04676333999668714
+   ],
+   "race": {
+    "threads": 4,
+    "forced_rebuilds": 3,
+    "errors": 0,
+    "error_types": []
+   }
+  }
+ }
+}

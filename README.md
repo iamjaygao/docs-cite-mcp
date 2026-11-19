@@ -21,7 +21,8 @@ a tree of engineering reports, or an Obsidian vault.
   Without them those files are listed in `reindex`'s `files_skipped` and
   Markdown works as before; the Markdown path is stdlib-only.
 - Optional: `fastembed` (Apache-2.0) for hybrid retrieval. It runs an ONNX model
-  on the CPU, no PyTorch, no GPU. The model (~70 MB) is downloaded once into
+  on the CPU, no PyTorch, no GPU. The model (about 70 MB, per fastembed's model
+  list) is downloaded once into
   `~/.cache/docs-cite-mcp/models` (`DOCS_CITE_MODEL_DIR`). Without fastembed, or
   with `DOCS_CITE_EMBED_MODEL=none`, search is BM25 only and every result says so.
 
@@ -145,8 +146,9 @@ Japanese.
 Dense retrieval embeds the same text BM25 scores (breadcrumb plus chunk) with
 `BAAI/bge-small-en-v1.5`, adding the query instruction prefix the model was
 trained with, and ranks by cosine similarity. The search is brute force over a
-matrix of unit vectors: exact, and about 3 ms for 500 chunks, so an approximate
-index would add a dependency without a measurable gain at this scale.
+matrix of unit vectors, so it is exact. A whole dense search call, including
+embedding the query, took 3.5 ms (median) over 488 chunks; at this scale an
+approximate index would add a dependency without a measurable gain.
 
 Hybrid (the default) takes the top 50 of each ranking and fuses them with
 reciprocal rank fusion, `score = Σ 1 / (60 + rank)`. RRF uses only ranks, so
@@ -230,19 +232,21 @@ lexical scores, so hybrid silently degrading to BM25 also fails it.
 
 Four retrieval changes were each tried against a private 40-query gold set over
 a real research-docs corpus (k=5, paired bootstrap over queries, 10,000
-resamples). Only the ones the data supported shipped:
+resamples), each against the same baseline: BM25 with hard 40-line cuts and no
+per-document cap. Only the ones the data supported shipped:
 
 | Change | Chunk-level NDCG@5 Δ | 95% CI | p | Decision |
 |---|---:|---|---:|---|
-| Cap 2 chunks per document | +0.017 | [0.001, 0.036] | 0.05 | **shipped** (default) |
+| Cap 2 chunks per document | +0.017 | [0.001, 0.036] | 0.053 | **shipped** (default) |
 | Cap 1 chunk per document | +0.059 | [0.026, 0.099] | 0.004 | available via `max_per_doc=1`, not the default |
-| Cut long sections at a blank line | +0.006 | [0.000, 0.019] | 0.25 | **shipped**: no query got worse |
-| Singularise plurals | +0.008 | [−0.024, 0.047] | 0.68 | rejected: helped some queries, hurt others |
-| Count a section's heading once, not twice | −0.006 | [−0.035, 0.019] | 0.67 | rejected: MRR@5 fell 0.753 → 0.715 |
+| Cut long sections at a blank line | +0.006 | [0.000, 0.016] | 0.22 | **shipped**: no query got worse |
+| Singularise plurals | +0.007 | [−0.024, 0.047] | 0.68 | rejected: helped some queries, hurt others |
+| Count a section's heading once, not twice | −0.006 | [−0.035, 0.019] | 0.67 | rejected: document-level MRR@5 fell 0.753 → 0.715 |
 
 The two shipped changes together: chunk-level NDCG@5 0.618 → 0.640 (p = 0.02),
-Recall@5 0.654 → 0.688 (p = 0.04), and the share of the top five held by a single
-document 0.505 → 0.355. Document-level scores are unchanged or slightly up.
+Recall@5 0.654 → 0.688 (p = 0.04), with no query scoring lower, and the share of
+the top five held by a single document 0.505 → 0.355. Document-level scores are
+unchanged or slightly up.
 
 A cap of 1 scores higher, but the gold set labels documents, not passages, so it
 cannot see the cost of hiding a document's second-best passage. 2 is the
@@ -259,27 +263,68 @@ lexical):
 
 | Retrieval | Chunk NDCG@5 | Δ vs lexical, 95% CI | p | Chunk R@5 | Doc R@5 | Search p50 |
 |---|---:|---|---:|---:|---:|---:|
-| Lexical (BM25) | 0.640 | | | 0.687 | 0.729 | 0.3 ms |
-| Dense, bge-small-en-v1.5 | 0.729 | +0.089 [+0.012, +0.174] | 0.03 | 0.758 | 0.808 | 3.3 ms |
+| Lexical (BM25) | 0.640 | | | 0.688 | 0.729 | 0.3 ms |
+| Dense, bge-small-en-v1.5 | 0.729 | +0.089 [+0.012, +0.174] | 0.03 | 0.758 | 0.808 | 3.5 ms |
 | **Hybrid, bge-small-en-v1.5** | **0.740** | **+0.100 [+0.039, +0.165]** | **0.002** | **0.792** | **0.808** | **3.7 ms** |
-| Dense, multilingual MiniLM-L12 | 0.635 | −0.005 [−0.089, +0.087] | 0.91 | 0.650 | 0.683 | 3.0 ms |
-| Hybrid, multilingual MiniLM-L12 | 0.701 | +0.061 [+0.015, +0.111] | 0.01 | 0.758 | 0.792 | 3.4 ms |
+| Dense, multilingual MiniLM-L12 | 0.635 | −0.005 [−0.089, +0.087] | 0.91 | 0.650 | 0.683 | 3.2 ms |
+| Hybrid, multilingual MiniLM-L12 | 0.702 | +0.061 [+0.015, +0.111] | 0.01 | 0.758 | 0.792 | 3.4 ms |
 
 Hybrid with bge-small met all three criteria and is the default. Dense alone
-gained about as much on average but with an interval twice as wide: it wins big
-on some queries and loses on others, and fusion keeps BM25's wins on exact
-terms. Of the five queries lexical retrieval missed entirely, hybrid recovered
+gained about as much on average, with a wider interval (width 0.162 against
+0.126 for hybrid) and a smaller lower bound, and fusion keeps BM25's wins on
+exact terms. Of the five queries lexical retrieval missed entirely, hybrid recovered
 two and lost one that lexical had found, so it still misses four. One of those
 asks for a model's "architecture" and "baseline" while its document uses
 neither word: the vocabulary gap dense retrieval is meant to bridge, and this
 small model did not.
 
-The cost is indexing time: embedding 488 chunks takes about 17 s on a laptop CPU
-against 0.03 s for BM25, paid once and then only for edited files.
+The cost is indexing time: a full build that embeds 488 chunks took 17.0 s on a
+laptop CPU against 0.04 s for BM25, paid once and then only for edited files.
 
 bge-small is English-only. For other languages set
 `DOCS_CITE_EMBED_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`;
-on this English corpus it was weaker, and it truncates at 128 tokens.
+on this English corpus it was weaker.
+
+### How much to trust these numbers
+
+- **Ten comparisons were run.** Under a Bonferroni threshold of 0.05 / 10 =
+  0.005, hybrid over BM25 (p = 0.002) remains significant. The cap of 2
+  (p = 0.053) and the two ranking changes together (p = 0.02) do not.
+- **One corpus, 40 queries, one labeler.** The gold set was labeled by the
+  project owner on their own research docs, at document level, with binary
+  relevance. Intervals are wide: hybrid's gain is +0.039 to +0.165.
+- **Single runs.** Lexical results are deterministic. Dense results come from
+  one ONNX run on one laptop, and latency is one call per query.
+
+### Reproducing the numbers
+
+Every number in this section is in a saved output, together with the code
+version, environment, corpus hash and gold-set hash it came from:
+
+- `results/retrieval_experiments.json`, written by
+  `bench/retrieval_experiments.py`. It re-runs every comparison above on one
+  code version; settings the shipped code no longer has (hard 40-line cuts,
+  plural stemming, counting a heading once) are restored by patching
+  `docs_index` for one arm.
+- `results/perf.json`, written by `bench/perf.py`. It times two code versions
+  on one seeded synthetic corpus (300 documents, 1,200 chunks, BM25 only;
+  median of 5 repeats), and reproduces the search/reindex race. Measured:
+  a rebuild with no file changed took 0.881 s at `d7629a2` and 0.064 s at
+  `8749f8e`; a BM25 query 0.273 ms and 0.047 ms; the race raised 9
+  `IndexError`s in one run on the old code and none on the current one. The
+  two versions are several changes apart, so no single change owns the
+  difference, and random-token text shows relative cost only.
+- `results/sample_eval_{lexical,hybrid}.json`: the public 10-query sample,
+  the same scores CI gates on.
+
+The 40-query gold set and its corpus are private, so others can re-run the
+scripts only on their own data. `docs/ground_truth_docs-cite-mcp.md` lists every
+number, the file and key it comes from, and the numbers that must not be used.
+
+`baseline_28q_document.json` and `baseline_28q_chunk.json` are outputs from an
+earlier, 28-query version of the gold set and an older version of the code.
+Re-running that code on today's corpus and gold set does not reproduce them, so
+they are kept only as history and are not comparable with the numbers above.
 
 ## Known limitations
 
@@ -298,8 +343,7 @@ on this English corpus it was weaker, and it truncates at 128 tokens.
   string and breadcrumb are how a person finds the passage. Text boxes,
   footnotes and comments are not extracted, and legacy `.doc` is not supported.
 - **Small models, no reranker.** bge-small reads at most 512 tokens of a chunk
-  and is English-only; the multilingual alternative reads 128. There is no
-  cross-encoder reranking stage after fusion.
+  and is English-only. There is no cross-encoder reranking stage after fusion.
 - **Dense retrieval was chosen on one corpus.** The 40-query set is one team's
   English research docs; other corpora may favour another model or lexical
   retrieval, which is why `mode` is a per-query parameter and the comparison is
@@ -318,8 +362,9 @@ This one is narrower on purpose:
 - **Line-level provenance, not file-level.** Existing servers return a matching
   document; this returns the passage plus the exact line span it occupies, and a
   tool to verify it.
-- **Retrieval quality is measured.** The gold set and corpus in this repo are
-  public, so the numbers are reproducible.
+- **Retrieval quality is measured.** The sample corpus and its 10-query gold
+  set are public and gate CI; the ranking decisions were made on a private
+  40-query set, with the scripts and saved results in `bench/` and `results/`.
 - **Not Obsidian-specific.** Reads any tree of Markdown, PDF and Word files off disk. No plugin, no
   running app, no Node.
 
